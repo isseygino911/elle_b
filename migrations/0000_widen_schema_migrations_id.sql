@@ -1,0 +1,41 @@
+-- 0000_widen_schema_migrations_id.sql
+-- Widens schema_migrations.id from VARCHAR(20) to VARCHAR(64).
+--
+-- Why: 0000_init.sql originally defined id VARCHAR(20), but the very first
+-- domain migration's own bookkeeping id, "0001_create_users_and_invitations",
+-- is 33 characters -- already past 20. On a genuinely fresh database (never
+-- hand-patched), server/migrations/run.js would run 0001's CREATE TABLE
+-- successfully but then fail on its own bookkeeping INSERT under MySQL 8's
+-- default strict SQL mode (data-too-long). Production only avoided this
+-- because the column was widened by hand out-of-band in an earlier session,
+-- untracked by any migration file until now.
+--
+-- Why this file is named 0000_... instead of the next free sequence number:
+-- it must run, in filename-sorted order, BEFORE 0001_create_users_and_invitations.sql,
+-- or a fresh install still fails before ever reaching a later-numbered fix.
+-- fs.readdirSync().sort() in run.js is a plain lexical sort:
+-- "0000_init.sql" < "0000_widen_schema_migrations_id.sql" (same "0000_"
+-- prefix, 'i' < 'w') < "0001_...". This is a deliberate, narrow exception to
+-- this directory's "next unused NNNN" naming convention (see README.md),
+-- justified by a real ordering constraint. It does not edit 0000_init.sql
+-- (untouched) or violate the "never edit an applied migration" rule -- this
+-- is a new sibling file.
+--
+-- Width choice: VARCHAR(64). Longest existing id is 33 chars
+-- ("0001_create_users_and_invitations"); 64 gives roughly 2x headroom over
+-- that for realistic future filenames without over-sizing a PK column that
+-- only ever holds one row per migration file for this project's lifetime.
+--
+-- For already-migrated environments (production, or any dev DB that already
+-- has 0001-0005 applied), this file is a pure widening ALTER, safe to run
+-- whenever run.js next encounters it -- no data loss, and file execution
+-- order doesn't matter there since 0001 already succeeded historically.
+
+ALTER TABLE schema_migrations
+  MODIFY COLUMN id VARCHAR(64) NOT NULL;
+
+-- Down / rollback (not executed by run.js -- forward-only convention; kept
+-- for reference/manual use only):
+-- ALTER TABLE schema_migrations MODIFY COLUMN id VARCHAR(20) NOT NULL;
+-- (effectively non-reversible in practice -- would immediately re-break 0001
+-- on a subsequent fresh install; normal for a forward-only project.)

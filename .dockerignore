@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+
+# Secrets — never baked into the image. .env is injected via docker-compose
+# env_file at runtime; keys/ is mounted read-only at runtime (see
+# docker-compose.prod.yml).
+.env
+.env.*
+!.env.example
+keys/
+*.pem
+*.key
+
+logs/
+*.log
+.git

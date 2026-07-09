@@ -1,0 +1,34 @@
+# =============================================================================
+# Student CRM — Production API (Docker)
+# =============================================================================
+# Runs just the Express API in a container. MySQL stays a native install on
+# the VPS (docker-compose.dev.yml is local-dev-only, unrelated to this file),
+# and Caddy stays a native install reverse-proxying to localhost:{PORT} per
+# the Caddyfile in this same repo — nothing here changes that.
+#
+# `network_mode: host` is deliberate: it means the container shares the
+# VPS's network namespace directly, so `DB_HOST=localhost` in .env keeps
+# working unchanged (reaching the native MySQL install) and Caddy's existing
+# `reverse_proxy localhost:{$PORT}` keeps working unchanged too — no
+# `host.docker.internal` plumbing, no port publishing/mapping to get wrong.
+# Trade-off: the container is not network-isolated from the host, which is
+# an acceptable trade for a single-service VPS. (Host networking only works
+# on Linux; irrelevant here since this is a Linux VPS deploy.)
+#
+# Usage (from this repo's root, on the VPS, after `git pull`):
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml logs -f
+#   docker compose -f docker-compose.prod.yml down
+# =============================================================================
+
+services:
+  api:
+    build:
+      context: .
+    container_name: student_crm_api
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ./.env
+    volumes:
+      - ./keys:/app/keys:ro

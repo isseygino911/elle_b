@@ -1,0 +1,32 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- JWT keypair (generated locally per .env.example instructions) ---
+keys/
+
+# --- Build output ---
+dist/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+pm2.log
+logs/
+
+# --- Local dev DB (docker-compose.dev.yml) ---
+docker-data/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Editor ---
+.vscode/
+.idea/

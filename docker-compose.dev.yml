@@ -1,0 +1,36 @@
+# =============================================================================
+# Student CRM — Local Dev MySQL (Phase 0)
+# =============================================================================
+# Purpose: spin up a local MySQL 8.0 instance for development only. This file
+# is NOT used in production — the VPS runs a native MySQL install per the
+# project's current deploy approach.
+#
+# Credential source of truth: .env in this same directory (this compose file
+# lives at the server repo's root). Compose's `${VAR}` interpolation below
+# only reads from a `.env` file next to this compose file by default, which
+# already matches that layout, but invocation still goes through
+# `package.json`'s `db:up` / `db:down` scripts for consistency with the
+# `--env-file` flag shown below.
+#
+# Usage (from this repo's root):
+#   npm run db:up
+#   npm run db:down
+# Equivalent raw commands:
+#   docker compose --env-file ./.env -f docker-compose.dev.yml up -d
+#   docker compose --env-file ./.env -f docker-compose.dev.yml down
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: student_crm_mysql_dev
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "${DB_PORT}:3306"
+    volumes:
+      - ./docker-data:/var/lib/mysql
