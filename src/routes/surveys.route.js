@@ -24,6 +24,7 @@ function serializeSurvey(row) {
   return {
     id: row.id,
     title: row.title,
+    title_zh: row.title_zh,
     original_filename: row.original_filename,
     uploaded_at: row.uploaded_at
   };
@@ -34,6 +35,7 @@ function serializeQuestion(row) {
     id: row.id,
     order_index: row.order_index,
     question_text: row.question_text,
+    question_text_zh: row.question_text_zh,
     points: row.points
   };
 }
@@ -43,6 +45,7 @@ function serializeAnswer(row) {
     id: row.id,
     order_index: row.order_index,
     answer_text: row.answer_text,
+    answer_text_zh: row.answer_text_zh,
     points: row.points,
     category: row.category
   };

@@ -21,12 +21,12 @@ const pool = require('../db/pool');
 // integer type instead, which mysql2 does convert to a JS number.
 async function getSurveyTotals() {
   const [rows] = await pool.query(
-    `SELECT sq.survey_id, s.title, COUNT(*) AS total_questions,
+    `SELECT sq.survey_id, s.title, s.title_zh, COUNT(*) AS total_questions,
             CAST(SUM(sq.points) AS UNSIGNED) AS total_points
      FROM survey_questions sq
      JOIN surveys s ON s.id = sq.survey_id
      WHERE EXISTS (SELECT 1 FROM survey_answers sa WHERE sa.question_id = sq.id)
-     GROUP BY sq.survey_id, s.title`
+     GROUP BY sq.survey_id, s.title, s.title_zh`
   );
   return rows;
 }
@@ -52,6 +52,7 @@ async function computeStudentSurveyScores(studentId) {
     return {
       survey_id: survey.survey_id,
       title: survey.title,
+      title_zh: survey.title_zh,
       total_questions: survey.total_questions,
       total_points: survey.total_points,
       completed_questions: response ? response.completed_questions : 0,
