@@ -7,11 +7,31 @@
 //   1. Flat: <question points="10">text</question> — the question is
 //      itself the single scored item. `answers` is [] for these.
 //   2. Nested: <question>prompt text<answer points="10" category="Music">
-//      answer text</answer>...</question> — the question is a prompt with
-//      its own set of scored answer choices. `points` on the returned
-//      question is the SUM of its answers' points (there is no points
-//      attribute on a nested <question> itself); `answers` holds each one.
+//      answer text</answer>...</question> — one DAY of the survey.
 // Both shapes can appear in the same survey.
+//
+// The nested shape is a RATING scale, not a multiple choice. Its
+// <question> text is a shared PREFIX rather than a standalone question,
+// and each <answer> is a separate rateable STATEMENT — prefix + statement
+// together form the real question. Given:
+//
+//   <question>I really enjoyed…
+//     <answer points="10" category="Music">Learning about the parts of the violin</answer>
+//     <answer points="10" category="Music">Learning some rhythm and notes</answer>
+//   </question>
+//
+// the student is asked "I really enjoyed *learning about the parts of the
+// violin*" and rates it 1-10, then likewise for every other statement —
+// they answer all of them, they do not pick one. An <answer>'s `points` is
+// therefore the MAXIMUM of that statement's 1..N rating scale (so
+// points="5" would mean a 1-5 scale), never a value earned by selecting
+// that line. Because "answer" here means "rateable statement", each one
+// produces its own survey_responses row at submit time (see
+// migrations/0014_survey_responses_per_answer.sql).
+//
+// `points` on the returned question is the SUM of its answers' points
+// (there is no points attribute on a nested <question> itself) — i.e. that
+// day's maximum achievable score, 50 for five 1-10 statements.
 //
 // Validation below is plain imperative JS, deliberately not zod. An earlier
 // version used z.union([...]).transform(...) for <question>/<answer>, but

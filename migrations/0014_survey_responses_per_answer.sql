@@ -1,0 +1,133 @@
+-- 0014_survey_responses_per_answer.sql
+-- Redesigns a survey submission from "the student picks ONE answer choice
+-- per day" to "the student RATES EVERY statement of that day on a 1-N
+-- scale". This corrects a misreading of the uploaded survey XML that goes
+-- back to 0010/0011.
+--
+-- What the XML actually means:
+--
+--   <question>I really enjoyed…
+--     <answer points="10" category="Music">Learning about the parts of the violin</answer>
+--     <answer points="10" category="Music">Listening to the different sounds a violin can make</answer>
+--     ... 3 more ...
+--   </question>
+--
+-- Each <question> is ONE DAY of the survey. Its text ("I really enjoyed…")
+-- is a shared PREFIX, not a standalone question, and each <answer> is a
+-- separate rateable STATEMENT -- prefix + statement together form the real
+-- question ("I really enjoyed *learning about the parts of the violin*").
+-- The student rates every statement from 1 to N, where N is that
+-- statement's `points` attribute. `points` is therefore the MAXIMUM of the
+-- rating scale, never a value earned by selecting that line.
+--
+-- So one day yields FIVE rows here, not one. The previous model physically
+-- could not store that: uq_survey_responses_question_id_student_id allowed
+-- exactly one row per (question, student).
+--
+-- Design notes:
+--   - The submission lock moves from "one submission per (question,
+--     student)" (0012) to "one rating per (statement, student)". A day is
+--     complete when it has a row for EVERY one of its survey_answers rows;
+--     the application layer (surveys.route.js attachLockState) enforces
+--     that completeness check, while this unique key enforces the
+--     no-double-rating half of it. A partially-rated day counts as
+--     unsubmitted, so the "complete the previous day first" gating in
+--     attachLockState continues to work unchanged.
+--   - points_earned keeps its SMALLINT UNSIGNED type but CHANGES MEANING.
+--     It was a denormalized copy of survey_answers.points (the max) taken
+--     at submit time; it is now the student's actual 1-N rating for that
+--     statement. This is the single most confusable part of this change:
+--     the column name still reads "points earned", and that is still
+--     accurate (a rating of 8 earns 8 points), but it is NO LONGER a copy
+--     of survey_answers.points and must never be re-derived from it. The
+--     0011 rationale for denormalizing -- a recorded score stays immutable
+--     even if survey content is edited later -- still holds, and applies
+--     even more strongly now that the value is student-supplied and cannot
+--     be reconstructed from survey content at all.
+--   - survey_questions.points needs no change: surveyXmlParser.js already
+--     computes it as the SUM of its answers' points, which is exactly the
+--     day's maximum achievable score under the rating model (5 statements
+--     x 10 = 50). It was only ever wrong under the old single-select
+--     reading, where a student could earn all 50 by clicking one option.
+--   - question_id stays on this table even though it is now derivable via
+--     survey_answers.question_id. It is the same pragmatic denormalization
+--     as survey_id (see 0011): "this student's rows for day X" and "how
+--     many distinct days has this student completed"
+--     (students.helpers.js's COUNT(DISTINCT question_id)) both stay
+--     join-free.
+--
+-- Existing data: every row currently in this table was written under the
+-- old meaning -- one row per day, points_earned = that answer's max. Those
+-- rows cannot be mechanically converted into per-statement ratings: a
+-- single pick carries no information whatsoever about how the student
+-- would have rated the other four statements, and its points_earned is a
+-- maximum rather than a rating. They are therefore deleted outright and
+-- students retake the surveys (confirmed with the product owner before
+-- this migration was written). Only progress is reset -- surveys,
+-- survey_questions and survey_answers are untouched, so uploaded survey
+-- content and its S3 objects all survive.
+--
+-- Indexing:
+--   - uq_survey_responses_answer_id_student_id (answer_id, student_id):
+--     replaces uq_survey_responses_question_id_student_id as the
+--     double-submission guard, re-scoped from per-day to per-statement.
+--     The submit endpoint's INSERT still fails on a duplicate, which the
+--     application layer still turns into a friendly "already submitted"
+--     error. Its leftmost column also satisfies InnoDB's FK-indexing
+--     requirement for fk_survey_responses_answer_id.
+--   - idx_survey_responses_answer_id (from 0011) is consequently redundant
+--     -- it is now a strict prefix of the unique key above -- so it is
+--     dropped rather than left as a duplicate index MySQL would have to
+--     maintain on every write.
+--   - idx_survey_responses_question_id_student_id (question_id,
+--     student_id): the old unique key's index is going away, and its
+--     leftmost column (question_id) was what satisfied InnoDB's
+--     FK-indexing requirement for fk_survey_responses_question_id. This
+--     non-unique index preserves that, and serves the same "all of this
+--     student's rows for this question" lookup the old key did -- the
+--     access pattern is unchanged, only its uniqueness constraint is.
+--   - idx_survey_responses_survey_id_student_id and
+--     idx_survey_responses_student_id (both 0011) are unaffected: their
+--     query patterns and FK-indexing justifications are unchanged here.
+--
+-- Statement grouping note: the DELETE is issued as its own statement
+-- before the ALTERs, so the new unique key can never collide with legacy
+-- rows while being built.
+--
+-- The index changes are then split into ADD-then-DROP rather than batched
+-- into one ALTER. Both new indexes are created first, so at every moment
+-- in between, fk_survey_responses_answer_id and
+-- fk_survey_responses_question_id each still have at least one index whose
+-- leftmost column covers them -- the old one, the new one, or both. InnoDB
+-- refuses to drop the last usable index backing a foreign key (errno 150),
+-- and whether it credits an index being added in the *same* statement is
+-- engine- and version-dependent; MariaDB in particular is documented in
+-- 0012 to mis-plan multi-clause ALTERs on this exact table. Ordering the
+-- statements explicitly sidesteps that entirely, at the cost of one extra
+-- rebuild of a table that was just emptied above -- i.e. free.
+
+-- Old rows are semantically invalid under the rating model (see "Existing
+-- data" above). Wipe them so students start clean.
+DELETE FROM survey_responses;
+
+-- Add the replacement indexes first (see "Statement grouping note"), so no
+-- foreign key is ever left without one.
+ALTER TABLE survey_responses
+  ADD UNIQUE KEY uq_survey_responses_answer_id_student_id (answer_id, student_id),
+  ADD KEY idx_survey_responses_question_id_student_id (question_id, student_id);
+
+-- Now the old per-day lock and the answer_id index it superseded can go.
+ALTER TABLE survey_responses
+  DROP INDEX uq_survey_responses_question_id_student_id,
+  DROP INDEX idx_survey_responses_answer_id;
+
+-- Down / rollback (not executed by run.js -- forward-only convention; kept
+-- for reference/manual use only). Note the data deleted above is NOT
+-- recoverable by this rollback:
+-- ALTER TABLE survey_responses
+--   ADD UNIQUE KEY uq_survey_responses_question_id_student_id (question_id, student_id),
+--   ADD KEY idx_survey_responses_answer_id (answer_id);
+--
+-- ALTER TABLE survey_responses
+--   DROP INDEX uq_survey_responses_answer_id_student_id,
+--   DROP INDEX idx_survey_responses_question_id_student_id;

@@ -8,6 +8,18 @@
 // excluded from every total here via the EXISTS check in getSurveyTotals,
 // matching the client's existing answerableQuestions filter
 // (SurveyDetailPage.jsx).
+//
+// Counting note: an answerable question is one DAY, but a day is stored as
+// one survey_responses row PER STATEMENT (see
+// 0014_survey_responses_per_answer.sql), so a five-statement day produces
+// five rows. Progress is measured in days, which is why the completed
+// counts below are COUNT(DISTINCT question_id) rather than COUNT(*) -- the
+// latter would report a single finished day as five completed questions
+// and overstate progress fivefold. Points are unaffected: SUM(points_earned)
+// sums the student's actual per-statement ratings, and the denominator
+// SUM(sq.points) is each day's max (itself the sum of its statements'
+// maxima, computed by surveyXmlParser.js), so both sides are on the same
+// scale.
 
 const pool = require('../db/pool');
 
@@ -37,7 +49,7 @@ async function computeStudentSurveyScores(studentId) {
   const surveyTotals = await getSurveyTotals();
 
   const [responseRows] = await pool.query(
-    `SELECT survey_id, COUNT(*) AS completed_questions,
+    `SELECT survey_id, COUNT(DISTINCT question_id) AS completed_questions,
             CAST(SUM(points_earned) AS UNSIGNED) AS earned_points,
             MAX(submitted_at) AS last_submitted_at
      FROM survey_responses
@@ -76,7 +88,7 @@ async function computeAllStudentsProgress() {
   );
 
   const [responseRows] = await pool.query(
-    `SELECT student_id, COUNT(*) AS completed_questions,
+    `SELECT student_id, COUNT(DISTINCT question_id) AS completed_questions,
             CAST(SUM(points_earned) AS UNSIGNED) AS earned_points,
             MAX(submitted_at) AS last_submitted_at
      FROM survey_responses

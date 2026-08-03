@@ -9,7 +9,7 @@ const {
   surveyIdParamSchema,
   surveyQuestionParamsSchema,
   surveyDetailQuerySchema,
-  submitAnswerSchema
+  submitRatingsSchema
 } = require('../schemas/surveys.schema');
 const { parseSurveyXml, SurveyXmlError } = require('../services/surveyXmlParser');
 const s3 = require('../services/s3');
@@ -60,6 +60,26 @@ function serializeResponse(row) {
   };
 }
 
+// Collapses a day's per-statement survey_responses rows into the single
+// `submission` object the client reads. A day is rated all at once, so its
+// rows share a submitted_at and are only ever surfaced together.
+//
+// `points_earned` is the sum of the day's ratings, which keeps every
+// existing consumer working unchanged (the client's points-earned tally and
+// its progress bar both read submission.points_earned against the day's
+// max, question.points) while `ratings` carries the per-statement detail
+// the rating UI needs to show what the student actually picked.
+function serializeSubmission(rows) {
+  return {
+    ratings: rows.map(serializeResponse),
+    points_earned: rows.reduce((sum, row) => sum + row.points_earned, 0),
+    submitted_at: rows.reduce(
+      (latest, row) => (latest === null || row.submitted_at > latest ? row.submitted_at : latest),
+      null
+    )
+  };
+}
+
 // Loads a survey's questions plus each question's answers (if any) and
 // merges them into `{ ...question, answers: [...] }` rows, ordered the same
 // way GET /:id and POST / have always returned questions. `runner` is
@@ -101,10 +121,18 @@ async function loadQuestionsWithAnswers(runner, surveyId) {
 // too.
 //
 // Walks the answerable subset (answers.length > 0) in order_index order:
-// every question at or before the first one with no response yet is
-// unlocked (with its submission attached, if any); everything after that
-// first gap is locked. Non-answerable ("flat") questions never participate
-// and are always unlocked with no submission.
+// every question at or before the first one not yet submitted is unlocked
+// (with its submission attached, if any); everything after that first gap
+// is locked. Non-answerable ("flat") questions never participate and are
+// always unlocked with no submission.
+//
+// A day counts as submitted only when EVERY one of its statements has been
+// rated -- each statement is its own survey_responses row, so a complete
+// day has as many rows as it has answers. A partially-rated day (only
+// reachable if a submit transaction half-failed) deliberately counts as
+// unsubmitted, so it stays the current unlocked day and the student can
+// submit it again rather than being stranded behind a day that can never
+// complete.
 function attachLockState(questions, responsesByQuestionId) {
   let gapFound = false;
 
@@ -115,14 +143,15 @@ function attachLockState(questions, responsesByQuestionId) {
       continue;
     }
 
-    const response = responsesByQuestionId.get(question.id);
+    const responses = responsesByQuestionId.get(question.id) || [];
+    const isComplete = responses.length === question.answers.length;
 
     if (gapFound) {
       question.locked = true;
       question.submission = null;
-    } else if (response) {
+    } else if (isComplete) {
       question.locked = false;
-      question.submission = serializeResponse(response);
+      question.submission = serializeSubmission(responses);
     } else {
       question.locked = false;
       question.submission = null;
@@ -134,17 +163,30 @@ function attachLockState(questions, responsesByQuestionId) {
 }
 
 // Loads every survey_responses row for a survey and a specific student,
-// keyed by question_id — the same lookup both GET /:id (lock state) and the
-// submit endpoint (ordering/already-submitted checks) need. Each student's
-// progress on a survey is independent, so this is always scoped to one
-// student_id.
+// grouped into an array per question_id — the same lookup both GET /:id
+// (lock state) and the submit endpoint (ordering/already-submitted checks)
+// need. Each student's progress on a survey is independent, so this is
+// always scoped to one student_id.
+//
+// The value is an array rather than a single row because a day is rated
+// statement by statement: one row per survey_answers row, not one per
+// question (see migrations/0014_survey_responses_per_answer.sql). Ordered
+// by answer_id so a day's ratings come back in a stable order.
 async function loadResponsesByQuestionId(runner, surveyId, studentId) {
   const [responseRows] = await runner.query(
-    'SELECT * FROM survey_responses WHERE survey_id = ? AND student_id = ?',
+    'SELECT * FROM survey_responses WHERE survey_id = ? AND student_id = ? ORDER BY question_id, answer_id',
     [surveyId, studentId]
   );
 
-  return new Map(responseRows.map((row) => [row.question_id, row]));
+  const responsesByQuestionId = new Map();
+  for (const row of responseRows) {
+    if (!responsesByQuestionId.has(row.question_id)) {
+      responsesByQuestionId.set(row.question_id, []);
+    }
+    responsesByQuestionId.get(row.question_id).push(row);
+  }
+
+  return responsesByQuestionId;
 }
 
 // Shared by GET /:id and GET /:id/download-url: loads the survey by id.
@@ -305,11 +347,16 @@ router.get(
   }
 );
 
+// Submits one whole day at once: every statement in the question carries
+// its own 1..N rating. All-or-nothing -- a day is never left half-rated,
+// because attachLockState only treats a day as complete when it has a row
+// for every statement, so a partial write would leave the student stuck on
+// a day that reads as unsubmitted.
 router.post(
   '/:id/questions/:questionId/submit',
   requireRole('student'),
   validateParams(surveyQuestionParamsSchema),
-  validateBody(submitAnswerSchema),
+  validateBody(submitRatingsSchema),
   async (req, res, next) => {
     try {
       const survey = await loadAuthorizedSurvey(req, res);
@@ -328,9 +375,37 @@ router.post(
         return res.status(400).json({ status: 'error', message: 'This question does not accept a submission' });
       }
 
-      const answer = question.answers.find((a) => a.id === req.body.answer_id);
-      if (!answer) {
+      const { ratings } = req.body;
+
+      // The submitted set must match this day's statements exactly:
+      // duplicates first (they would otherwise mask a missing statement by
+      // keeping the counts equal), then unknown ids, then completeness.
+      const submittedIds = ratings.map((entry) => entry.answer_id);
+      if (new Set(submittedIds).size !== submittedIds.length) {
+        return res.status(400).json({ status: 'error', message: 'Each statement may only be rated once' });
+      }
+
+      const answersById = new Map(question.answers.map((answer) => [answer.id, answer]));
+      const unknownId = submittedIds.find((id) => !answersById.has(id));
+      if (unknownId !== undefined) {
         return res.status(400).json({ status: 'error', message: 'answer_id does not belong to this question' });
+      }
+
+      if (submittedIds.length !== question.answers.length) {
+        return res.status(400).json({ status: 'error', message: 'Rate every statement before submitting this day' });
+      }
+
+      // Each statement's scale runs 1..its own points, so the ceiling is
+      // per-statement and can't live in the zod schema (which enforces only
+      // the integer >= 1 floor).
+      for (const entry of ratings) {
+        const answer = answersById.get(entry.answer_id);
+        if (entry.rating > answer.points) {
+          return res.status(400).json({
+            status: 'error',
+            message: `Rating for "${answer.answer_text}" must be between 1 and ${answer.points}`
+          });
+        }
       }
 
       const responsesByQuestionId = await loadResponsesByQuestionId(pool, survey.id, req.user.id);
@@ -344,23 +419,39 @@ router.post(
         return res.status(400).json({ status: 'error', message: 'Complete the previous day before submitting this one.' });
       }
 
-      let insertResult;
+      const connection = await pool.getConnection();
+
       try {
-        [insertResult] = await pool.query(
+        await connection.beginTransaction();
+
+        // A half-rated day is indistinguishable from an unsubmitted one, so
+        // all of the day's rows land together or none of them do.
+        await connection.query(
           `INSERT INTO survey_responses (survey_id, question_id, student_id, answer_id, points_earned)
-           VALUES (?, ?, ?, ?, ?)`,
-          [survey.id, question.id, req.user.id, answer.id, answer.points]
+           VALUES ?`,
+          [ratings.map((entry) => [survey.id, question.id, req.user.id, entry.answer_id, entry.rating])]
         );
+
+        await connection.commit();
       } catch (err) {
+        await connection.rollback();
+
+        // Two concurrent submissions of the same day: whichever loses the
+        // race trips uq_survey_responses_answer_id_student_id.
         if (err.code === 'ER_DUP_ENTRY') {
           return res.status(409).json({ status: 'error', message: 'This day has already been submitted' });
         }
         throw err;
+      } finally {
+        connection.release();
       }
 
-      const [responseRows] = await pool.query('SELECT * FROM survey_responses WHERE id = ?', [insertResult.insertId]);
+      const [responseRows] = await pool.query(
+        'SELECT * FROM survey_responses WHERE question_id = ? AND student_id = ? ORDER BY answer_id',
+        [question.id, req.user.id]
+      );
 
-      res.status(201).json({ response: serializeResponse(responseRows[0]) });
+      res.status(201).json({ submission: serializeSubmission(responseRows) });
     } catch (err) {
       next(err);
     }
