@@ -114,31 +114,25 @@ async function loadQuestionsWithAnswers(runner, surveyId) {
 }
 
 // Mutates `questions` (as returned by loadQuestionsWithAnswers) in place,
-// adding `submission` and `locked` to each one. Not part of
-// loadQuestionsWithAnswers itself so that POST / (upload) — which reuses
-// loadQuestionsWithAnswers for its own response — stays unaffected; only
-// callers that actually want submission/lock state opt in by calling this
-// too.
+// adding `submission` to each one. Not part of loadQuestionsWithAnswers
+// itself so that POST / (upload) — which reuses loadQuestionsWithAnswers
+// for its own response — stays unaffected; only callers that actually want
+// submission state opt in by calling this too.
 //
-// Walks the answerable subset (answers.length > 0) in order_index order:
-// every question at or before the first one not yet submitted is unlocked
-// (with its submission attached, if any); everything after that first gap
-// is locked. Non-answerable ("flat") questions never participate and are
-// always unlocked with no submission.
+// Days are independent: a student may rate them in any order, so there is
+// no sequential gate and every answerable day is always available. A day
+// that has been submitted carries its `submission`; one that hasn't gets
+// null.
 //
 // A day counts as submitted only when EVERY one of its statements has been
 // rated -- each statement is its own survey_responses row, so a complete
 // day has as many rows as it has answers. A partially-rated day (only
 // reachable if a submit transaction half-failed) deliberately counts as
-// unsubmitted, so it stays the current unlocked day and the student can
-// submit it again rather than being stranded behind a day that can never
-// complete.
-function attachLockState(questions, responsesByQuestionId) {
-  let gapFound = false;
-
+// unsubmitted, so the student can submit it again rather than being
+// stranded on a day that can never complete.
+function attachSubmissions(questions, responsesByQuestionId) {
   for (const question of questions) {
     if (question.answers.length === 0) {
-      question.locked = false;
       question.submission = null;
       continue;
     }
@@ -146,17 +140,7 @@ function attachLockState(questions, responsesByQuestionId) {
     const responses = responsesByQuestionId.get(question.id) || [];
     const isComplete = responses.length === question.answers.length;
 
-    if (gapFound) {
-      question.locked = true;
-      question.submission = null;
-    } else if (isComplete) {
-      question.locked = false;
-      question.submission = serializeSubmission(responses);
-    } else {
-      question.locked = false;
-      question.submission = null;
-      gapFound = true;
-    }
+    question.submission = isComplete ? serializeSubmission(responses) : null;
   }
 
   return questions;
@@ -329,10 +313,9 @@ router.get(
 
       if (studentId) {
         const responsesByQuestionId = await loadResponsesByQuestionId(pool, survey.id, studentId);
-        attachLockState(questionsWithAnswers, responsesByQuestionId);
+        attachSubmissions(questionsWithAnswers, responsesByQuestionId);
       } else {
         for (const question of questionsWithAnswers) {
-          question.locked = false;
           question.submission = null;
         }
       }
@@ -349,9 +332,9 @@ router.get(
 
 // Submits one whole day at once: every statement in the question carries
 // its own 1..N rating. All-or-nothing -- a day is never left half-rated,
-// because attachLockState only treats a day as complete when it has a row
-// for every statement, so a partial write would leave the student stuck on
-// a day that reads as unsubmitted.
+// because attachSubmissions only treats a day as complete when it has a row
+// for every statement, so a partial write would leave that day reading as
+// unsubmitted. Days may be submitted in any order, but each only once.
 router.post(
   '/:id/questions/:questionId/submit',
   requireRole('student'),
@@ -409,14 +392,10 @@ router.post(
       }
 
       const responsesByQuestionId = await loadResponsesByQuestionId(pool, survey.id, req.user.id);
-      attachLockState(questions, responsesByQuestionId);
+      attachSubmissions(questions, responsesByQuestionId);
 
       if (question.submission) {
         return res.status(409).json({ status: 'error', message: 'This day has already been submitted' });
-      }
-
-      if (question.locked) {
-        return res.status(400).json({ status: 'error', message: 'Complete the previous day before submitting this one.' });
       }
 
       const connection = await pool.getConnection();
