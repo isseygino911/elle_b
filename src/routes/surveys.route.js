@@ -1,8 +1,9 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { requireRole, requireAuth } = require('../middleware/auth');
+const { requireRole, requireAuth, requireCapability } = require('../middleware/auth');
 const { uploadSurveyFile } = require('../middleware/upload');
+const { ROLES, CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { validateBody, validateParams, validateQuery } = require('../middleware/validate');
 const {
   uploadMetadataSchema,
@@ -14,6 +15,7 @@ const {
 const { parseSurveyXml, SurveyXmlError } = require('../services/surveyXmlParser');
 const s3 = require('../services/s3');
 const { sanitizeFilename } = require('../utils/sanitizeFilename');
+const { assertStudentInScope } = require('../utils/students');
 const { DOWNLOAD_URL_EXPIRES_IN_SECONDS } = s3;
 
 const router = express.Router();
@@ -84,10 +86,15 @@ function serializeSubmission(rows) {
 // merges them into `{ ...question, answers: [...] }` rows, ordered the same
 // way GET /:id and POST / have always returned questions. `runner` is
 // either the pool or a transaction connection — both expose `.query()`.
-async function loadQuestionsWithAnswers(runner, surveyId) {
+//
+// `orgId` is redundant given every caller resolves `surveyId` through an
+// org-fenced load first, but both child tables carry org_id (0023) so the
+// predicate is free — and it means a future caller that forgets to fence the
+// parent still can't read across organizations.
+async function loadQuestionsWithAnswers(runner, surveyId, orgId) {
   const [questionRows] = await runner.query(
-    'SELECT * FROM survey_questions WHERE survey_id = ? ORDER BY order_index',
-    [surveyId]
+    'SELECT * FROM survey_questions WHERE survey_id = ? AND org_id = ? ORDER BY order_index',
+    [surveyId, orgId]
   );
 
   if (questionRows.length === 0) {
@@ -95,8 +102,8 @@ async function loadQuestionsWithAnswers(runner, surveyId) {
   }
 
   const [answerRows] = await runner.query(
-    'SELECT * FROM survey_answers WHERE question_id IN (?) ORDER BY question_id, order_index',
-    [questionRows.map((row) => row.id)]
+    'SELECT * FROM survey_answers WHERE question_id IN (?) AND org_id = ? ORDER BY question_id, order_index',
+    [questionRows.map((row) => row.id), orgId]
   );
 
   const answersByQuestionId = new Map();
@@ -173,12 +180,22 @@ async function loadResponsesByQuestionId(runner, surveyId, studentId) {
   return responsesByQuestionId;
 }
 
-// Shared by GET /:id and GET /:id/download-url: loads the survey by id.
-// Surveys have no ownership anymore — any authenticated user can view any
-// survey — so this just checks existence. Returns the survey row, or null
-// after already sending the response.
+// Shared by GET /:id, GET /:id/download-url and DELETE /:id: loads the survey
+// by id, fenced to the caller's organization.
+//
+// Surveys have no per-teacher owner — migration 0012 dropped student_id, and
+// 0023 kept surveys org-level curriculum every student can take — so the fence
+// is org_id and nothing else. That is deliberately NOT scopeFor(): a student
+// caller would throw there (scope.js demands a `student` column this table
+// doesn't have), and students must reach their own org's surveys to take them.
+//
+// A survey in another organization gets a 404, not a 403, so ids can't be
+// probed for existence.
 async function loadAuthorizedSurvey(req, res) {
-  const [rows] = await pool.query('SELECT * FROM surveys WHERE id = ?', [req.params.id]);
+  const [rows] = await pool.query('SELECT * FROM surveys WHERE id = ? AND org_id = ?', [
+    req.params.id,
+    req.user.orgId
+  ]);
   const survey = rows[0];
 
   if (!survey) {
@@ -191,7 +208,7 @@ async function loadAuthorizedSurvey(req, res) {
 
 router.post(
   '/',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   uploadSurveyFile('file'),
   validateBody(uploadMetadataSchema),
   async (req, res, next) => {
@@ -227,16 +244,16 @@ router.post(
         await connection.beginTransaction();
 
         const [insertResult] = await connection.query(
-          `INSERT INTO surveys (title, s3_key, original_filename)
-           VALUES (?, ?, ?)`,
-          [title, s3Key, req.file.originalname]
+          `INSERT INTO surveys (org_id, title, s3_key, original_filename)
+           VALUES (?, ?, ?, ?)`,
+          [req.user.orgId, title, s3Key, req.file.originalname]
         );
         const surveyId = insertResult.insertId;
 
         const [questionsInsertResult] = await connection.query(
-          `INSERT INTO survey_questions (survey_id, order_index, question_text, points)
+          `INSERT INTO survey_questions (org_id, survey_id, order_index, question_text, points)
            VALUES ?`,
-          [questions.map((q) => [surveyId, q.order_index, q.question_text, q.points])]
+          [questions.map((q) => [req.user.orgId, surveyId, q.order_index, q.question_text, q.points])]
         );
 
         // The multi-row INSERT above is a "simple insert" (fixed, known row
@@ -252,13 +269,20 @@ router.post(
         questions.forEach((question, index) => {
           const questionId = firstQuestionId + index;
           question.answers.forEach((answer, answerIndex) => {
-            answerRows.push([questionId, answerIndex, answer.answer_text, answer.points, answer.category]);
+            answerRows.push([
+              req.user.orgId,
+              questionId,
+              answerIndex,
+              answer.answer_text,
+              answer.points,
+              answer.category
+            ]);
           });
         });
 
         if (answerRows.length > 0) {
           await connection.query(
-            `INSERT INTO survey_answers (question_id, order_index, answer_text, points, category)
+            `INSERT INTO survey_answers (org_id, question_id, order_index, answer_text, points, category)
              VALUES ?`,
             [answerRows]
           );
@@ -266,8 +290,15 @@ router.post(
 
         await connection.commit();
 
-        const [surveyRows] = await connection.query('SELECT * FROM surveys WHERE id = ?', [surveyId]);
-        const questionsWithAnswers = await loadQuestionsWithAnswers(connection, surveyId);
+        const [surveyRows] = await connection.query(
+          'SELECT * FROM surveys WHERE id = ? AND org_id = ?',
+          [surveyId, req.user.orgId]
+        );
+        const questionsWithAnswers = await loadQuestionsWithAnswers(
+          connection,
+          surveyId,
+          req.user.orgId
+        );
 
         res.status(201).json({
           survey: serializeSurvey(surveyRows[0]),
@@ -287,7 +318,10 @@ router.post(
 
 router.get('/', requireAuth(), async (req, res, next) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM surveys ORDER BY uploaded_at DESC');
+    const [rows] = await pool.query(
+      'SELECT * FROM surveys WHERE org_id = ? ORDER BY uploaded_at DESC',
+      [req.user.orgId]
+    );
 
     res.status(200).json({ surveys: rows.map(serializeSurvey) });
   } catch (err) {
@@ -307,9 +341,35 @@ router.get(
         return;
       }
 
-      const questionsWithAnswers = await loadQuestionsWithAnswers(pool, survey.id);
+      const questionsWithAnswers = await loadQuestionsWithAnswers(
+        pool,
+        survey.id,
+        req.user.orgId
+      );
 
-      const studentId = req.user.role === 'student' ? req.user.id : req.query.student_id;
+      // A student always sees their own answers and cannot ask for anyone
+      // else's -- ?student_id= is ignored for them rather than honoured.
+      //
+      // The route is requireAuth(), NOT requireCapability: a student has to
+      // reach their own org's survey to take it. So the per-student boundary
+      // is enforced here instead, by assertStudentInScope -- which returns
+      // null for a manager unconditionally, for a student outside the
+      // caller's org, and for a student off an admin's own roster. An
+      // individual student's answers are exactly the per-student detail the
+      // manager role must never see.
+      //
+      // Out of scope is a 404, matching the survey load above: an id that
+      // isn't yours reads as absent rather than forbidden.
+      let studentId = null;
+      if (req.user.role === ROLES.STUDENT) {
+        studentId = req.user.id;
+      } else if (req.query.student_id) {
+        const student = await assertStudentInScope(req.user, req.query.student_id);
+        if (!student) {
+          return res.status(404).json({ status: 'error', message: 'Survey not found' });
+        }
+        studentId = student.id;
+      }
 
       if (studentId) {
         const responsesByQuestionId = await loadResponsesByQuestionId(pool, survey.id, studentId);
@@ -337,7 +397,7 @@ router.get(
 // unsubmitted. Days may be submitted in any order, but each only once.
 router.post(
   '/:id/questions/:questionId/submit',
-  requireRole('student'),
+  requireRole(ROLES.STUDENT),
   validateParams(surveyQuestionParamsSchema),
   validateBody(submitRatingsSchema),
   async (req, res, next) => {
@@ -347,7 +407,7 @@ router.post(
         return;
       }
 
-      const questions = await loadQuestionsWithAnswers(pool, survey.id);
+      const questions = await loadQuestionsWithAnswers(pool, survey.id, req.user.orgId);
       const question = questions.find((q) => q.id === Number(req.params.questionId));
 
       if (!question) {
@@ -465,15 +525,15 @@ router.get(
 
 router.delete(
   '/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(surveyIdParamSchema),
   async (req, res, next) => {
     try {
-      const [rows] = await pool.query('SELECT * FROM surveys WHERE id = ?', [req.params.id]);
-      const survey = rows[0];
-
+      // Uses the org-fenced loader rather than its own SELECT, so a survey in
+      // another organization 404s BEFORE the S3 object is destroyed below.
+      const survey = await loadAuthorizedSurvey(req, res);
       if (!survey) {
-        return res.status(404).json({ status: 'error', message: 'Survey not found' });
+        return;
       }
 
       try {
@@ -482,7 +542,10 @@ router.delete(
         console.error('S3 deleteSurveyObject failed:', err);
       }
 
-      await pool.query('DELETE FROM surveys WHERE id = ?', [survey.id]);
+      await pool.query('DELETE FROM surveys WHERE id = ? AND org_id = ?', [
+        survey.id,
+        req.user.orgId
+      ]);
 
       res.status(200).json({ status: 'ok' });
     } catch (err) {

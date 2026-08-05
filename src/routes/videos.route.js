@@ -1,8 +1,11 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { requireRole, requireAuth } = require('../middleware/auth');
+const { requireAuth, requireCapability } = require('../middleware/auth');
+const { CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { validateBody, validateParams, validateQuery } = require('../middleware/validate');
+const { scopeFor } = require('../utils/scope');
+const { ROLES } = require('../constants/roles');
 const {
   uploadUrlRequestSchema,
   createVideoSchema,
@@ -20,19 +23,22 @@ const {
 const s3 = require('../services/s3');
 const { sanitizeFilename } = require('../utils/sanitizeFilename');
 const { serializeVideo, loadAuthorizedVideo } = require('./videos.helpers');
-const { studentExists } = require('../utils/students');
+const { assertStudentInScope } = require('../utils/students');
 
 const router = express.Router();
 
-// Confirms a student_id references a real role='student' user. Returns true
-// if valid, otherwise sends a 400 and returns false.
-async function assertStudentExists(res, studentId) {
-  if (!(await studentExists(studentId))) {
+// Confirms a student_id references a student the CALLER MAY ACT ON -- same
+// organization, and for a teacher, their own roster. Returns true if valid,
+// otherwise sends a 400 and returns false.
+async function assertStudentExists(req, res, studentId) {
+  const student = await assertStudentInScope(req.user, studentId);
+
+  if (!student) {
     res.status(400).json({ status: 'error', message: 'student_id does not reference an existing student' });
-    return false;
+    return null;
   }
 
-  return true;
+  return student;
 }
 
 // Shared by POST /upload-url and POST / (both need identical role/type/
@@ -46,7 +52,7 @@ async function resolveVideoStudentId(req, res) {
   const { type } = req.body;
   const bodyStudentId = req.body.student_id;
 
-  if (req.user.role === 'student') {
+  if (req.user.role === ROLES.STUDENT) {
     if (type === 'class') {
       res.status(403).json({ status: 'error', message: 'Students may only upload practice videos' });
       return null;
@@ -57,7 +63,7 @@ async function resolveVideoStudentId(req, res) {
       return null;
     }
 
-    return { studentId: req.user.id };
+    return { studentId: req.user.id, adminId: req.user.adminId };
   }
 
   if (type === 'practice') {
@@ -66,22 +72,25 @@ async function resolveVideoStudentId(req, res) {
       return null;
     }
 
-    if (!(await assertStudentExists(res, bodyStudentId))) {
+    const student = await assertStudentExists(req, res, bodyStudentId);
+    if (!student) {
       return null;
     }
 
-    return { studentId: bodyStudentId };
+    return { studentId: bodyStudentId, adminId: student.admin_id };
   }
 
   if (bodyStudentId !== undefined && bodyStudentId !== null) {
-    if (!(await assertStudentExists(res, bodyStudentId))) {
+    const student = await assertStudentExists(req, res, bodyStudentId);
+    if (!student) {
       return null;
     }
 
-    return { studentId: bodyStudentId };
+    return { studentId: bodyStudentId, adminId: student.admin_id };
   }
 
-  return { studentId: null };
+  // Class video with no student: the uploading teacher owns it.
+  return { studentId: null, adminId: req.user.role === ROLES.ADMIN ? req.user.id : null };
 }
 
 router.post(
@@ -152,12 +161,23 @@ router.post(
 
       try {
         const [insertResult] = await pool.query(
-          `INSERT INTO videos (type, student_id, title, s3_key, duration_sec, status, uploaded_by)
-           VALUES (?, ?, ?, ?, ?, 'pending_review', ?)`,
-          [type, resolved.studentId, title, s3Key, durationSec ?? null, req.user.id]
+          `INSERT INTO videos (org_id, admin_id, type, student_id, title, s3_key, duration_sec, status, uploaded_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
+          [
+            req.user.orgId,
+            // The owning teacher: for a student uploader it is their own
+            // admin; for a teacher it is themselves. May be null for an
+            // org-level class video with no student (videos.admin_id is
+            // nullable by design -- see migration 0023).
+            resolved.adminId ?? null,
+            type, resolved.studentId, title, s3Key, durationSec ?? null, req.user.id
+          ]
         );
 
-        const [videoRows] = await pool.query('SELECT * FROM videos WHERE id = ?', [insertResult.insertId]);
+        const [videoRows] = await pool.query(
+          'SELECT * FROM videos WHERE id = ? AND org_id = ?',
+          [insertResult.insertId, req.user.orgId]
+        );
 
         res.status(201).json({ video: serializeVideo(videoRows[0]) });
       } catch (err) {
@@ -174,25 +194,34 @@ router.post(
 
 router.get('/', requireAuth(), validateQuery(listVideosQuerySchema), async (req, res, next) => {
   try {
-    const conditions = [];
-    const params = [];
+    // Tenancy first: a student sees only their own videos, an admin only
+    // those of their own students, an owner everything in their org. A
+    // manager is rejected outright -- a practice video is per-student detail.
+    const scope = scopeFor(req.user, {
+      org: 'org_id',
+      admin: 'admin_id',
+      student: 'student_id'
+    });
 
-    if (req.user.role === 'student') {
+    const conditions = [scope.sql];
+    const params = [...scope.params];
+
+    // Filters now apply for EVERY role, not just non-students. Previously they
+    // sat in an `else` branch, so a student passing ?type=class was silently
+    // ignored. There is no widening risk: the scope predicate above already
+    // pins student_id for a student caller, so an additional student_id filter
+    // can only narrow the result set, never expand it.
+    if (req.query.student_id) {
       conditions.push('student_id = ?');
-      params.push(req.user.id);
-    } else {
-      if (req.query.student_id) {
-        conditions.push('student_id = ?');
-        params.push(req.query.student_id);
-      }
-      if (req.query.type) {
-        conditions.push('type = ?');
-        params.push(req.query.type);
-      }
-      if (req.query.status) {
-        conditions.push('status = ?');
-        params.push(req.query.status);
-      }
+      params.push(req.query.student_id);
+    }
+    if (req.query.type) {
+      conditions.push('type = ?');
+      params.push(req.query.type);
+    }
+    if (req.query.status) {
+      conditions.push('status = ?');
+      params.push(req.query.status);
     }
 
     let query = 'SELECT * FROM videos';
@@ -255,7 +284,7 @@ router.get(
 
 router.patch(
   '/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(videoIdParamSchema),
   validateBody(updateVideoStatusSchema),
   async (req, res, next) => {
@@ -268,16 +297,29 @@ router.patch(
         });
       }
 
-      const [result] = await pool.query('UPDATE videos SET status = ? WHERE id = ?', [
-        req.body.status,
-        req.params.id
-      ]);
+      // Scoped like PATCH /bookings/:id: the tenancy predicate rides on the
+      // UPDATE itself, so affectedRows === 0 covers both "no such video" and
+      // "not yours" without a separate lookup -- and without distinguishing
+      // them to the caller.
+      const scope = scopeFor(req.user, {
+        org: 'org_id',
+        admin: 'admin_id',
+        student: 'student_id'
+      });
+
+      const [result] = await pool.query(
+        `UPDATE videos SET status = ? WHERE id = ? AND ${scope.sql}`,
+        [req.body.status, req.params.id, ...scope.params]
+      );
 
       if (result.affectedRows === 0) {
         return res.status(404).json({ status: 'error', message: 'Video not found' });
       }
 
-      const [videoRows] = await pool.query('SELECT * FROM videos WHERE id = ?', [req.params.id]);
+      const [videoRows] = await pool.query(
+        `SELECT * FROM videos WHERE id = ? AND ${scope.sql}`,
+        [req.params.id, ...scope.params]
+      );
 
       res.status(200).json({ video: serializeVideo(videoRows[0]) });
     } catch (err) {
@@ -286,17 +328,19 @@ router.patch(
   }
 );
 
+// requireAuth() and not requireCapability, deliberately: the uploaded_by check
+// below is STRICTER than either capability set -- you may only delete what you
+// uploaded yourself -- and a student deleting their own practice video is a
+// legitimate flow that requireCapability({owner, admin}) would break.
 router.delete(
   '/:id',
   requireAuth(),
   validateParams(videoIdParamSchema),
   async (req, res, next) => {
     try {
-      const [rows] = await pool.query('SELECT * FROM videos WHERE id = ?', [req.params.id]);
-      const video = rows[0];
-
+      const video = await loadAuthorizedVideo(req, res);
       if (!video) {
-        return res.status(404).json({ status: 'error', message: 'Video not found' });
+        return;
       }
 
       if (video.uploaded_by !== req.user.id) {
@@ -318,7 +362,10 @@ router.delete(
         console.error('S3 deleteVideoObject failed:', err);
       }
 
-      await pool.query('DELETE FROM videos WHERE id = ?', [video.id]);
+      await pool.query('DELETE FROM videos WHERE id = ? AND org_id = ?', [
+        video.id,
+        req.user.orgId
+      ]);
 
       res.status(200).json({ status: 'ok' });
     } catch (err) {

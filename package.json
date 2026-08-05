@@ -9,6 +9,7 @@
     "dev": "nodemon src/index.js",
     "migrate": "node migrations/run.js",
     "seed:elle": "node scripts/seed-elle.js",
+    "seed:owner": "node scripts/seed-owner.js",
     "db:up": "docker compose --env-file ./.env -f docker-compose.dev.yml up -d",
     "db:down": "docker compose --env-file ./.env -f docker-compose.dev.yml down"
   },

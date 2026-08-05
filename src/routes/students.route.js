@@ -1,6 +1,9 @@
 const express = require('express');
 const pool = require('../db/pool');
-const { requireRole } = require('../middleware/auth');
+const { scopeFor } = require('../utils/scope');
+const { assertStudentInScope } = require('../utils/students');
+const { requireCapability } = require('../middleware/auth');
+const { CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { validateParams } = require('../middleware/validate');
 const { studentIdParamSchema } = require('../schemas/students.schema');
 const { computeStudentSurveyScores, computeAllStudentsProgress } = require('./students.helpers');
@@ -18,10 +21,14 @@ function serializeStudent(row) {
   };
 }
 
-router.get('/', requireRole('elle'), async (req, res, next) => {
+router.get('/', requireCapability(CAN_READ_STUDENT_DETAIL), async (req, res, next) => {
   try {
+    // An admin sees only their own roster; an owner sees the whole
+    // organization. Previously this returned EVERY student in the database.
+    const scope = scopeFor(req.user, { org: 'org_id', admin: 'admin_id' });
     const [rows] = await pool.query(
-      "SELECT id, name, email FROM users WHERE role = 'student' ORDER BY name"
+      `SELECT id, name, email FROM users WHERE role = 'student' AND ${scope.sql} ORDER BY name`,
+      scope.params
     );
 
     res.status(200).json({ students: rows.map(serializeStudent) });
@@ -34,9 +41,9 @@ router.get('/', requireRole('elle'), async (req, res, next) => {
 // Students list panel's per-row badge. Same computeAllStudentsProgress used
 // by the dashboard's student_progress widget (dashboard.route.js), so both
 // surfaces agree on what "completion" means.
-router.get('/progress', requireRole('elle'), async (req, res, next) => {
+router.get('/progress', requireCapability(CAN_READ_STUDENT_DETAIL), async (req, res, next) => {
   try {
-    const students = await computeAllStudentsProgress();
+    const students = await computeAllStudentsProgress(req.user);
     res.status(200).json({ students });
   } catch (err) {
     next(err);
@@ -45,21 +52,21 @@ router.get('/progress', requireRole('elle'), async (req, res, next) => {
 
 router.get(
   '/:id/scores',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(studentIdParamSchema),
   async (req, res, next) => {
     try {
-      const [rows] = await pool.query(
-        "SELECT id, name, email FROM users WHERE role = 'student' AND id = ?",
-        [req.params.id]
-      );
-      const student = rows[0];
+      // assertStudentInScope, not a bare id lookup: an admin must not be able
+      // to read a peer's student's scores by guessing an id, and nobody may
+      // reach across organizations. A student not in scope is reported as 404,
+      // indistinguishable from "does not exist".
+      const student = await assertStudentInScope(req.user, req.params.id);
 
       if (!student) {
         return res.status(404).json({ status: 'error', message: 'Student not found' });
       }
 
-      const scores = await computeStudentSurveyScores(student.id);
+      const scores = await computeStudentSurveyScores(student.id, student.org_id);
 
       res.status(200).json({ student: serializeStudent(student), scores });
     } catch (err) {

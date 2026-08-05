@@ -16,6 +16,7 @@
 
 const pool = require('../db/pool');
 const { easternWallClockToUtc, getEasternDateParts } = require('../utils/timezone');
+const { scopeFor } = require('../utils/scope');
 
 const SLOT_MINUTES = 30;
 
@@ -52,10 +53,21 @@ function parseTimeToMinutes(timeString) {
 // America/New_York wall-clock time) minus any already-'booked' bookings
 // and any already-past slots (if date is the current Eastern calendar
 // date). `executor` is either the shared pool or an open transaction
-// connection — both expose `.query()` (see utils/elleUser.js's identical
+// connection — both expose `.query()` (see utils/counterparty.js's identical
 // convention) — so POST /bookings can re-run this same computation inside
 // its own transaction to re-check the requested slot is still open.
-async function computeOpenSlots(executor, date) {
+// `adminId` is REQUIRED: it identifies whose calendar is being computed. It
+// was absent under the single-teacher model, when "the availability table"
+// and "the bookings table" each belonged to the only teacher there was. With
+// several teachers, omitting it would union every teacher's availability and
+// subtract every teacher's bookings -- so teacher A's 09:00 session would
+// silently erase 09:00 from teacher B's open slots, and each teacher would be
+// offered the others' hours.
+async function computeOpenSlots(executor, date, adminId) {
+  if (!adminId) {
+    throw new Error('computeOpenSlots requires an adminId');
+  }
+
   const [year, month, day] = date.split('-').map(Number);
 
   // Day-of-week for a pure calendar date needs no timezone conversion --
@@ -73,16 +85,16 @@ async function computeOpenSlots(executor, date) {
   );
 
   const [availabilityRows] = await executor.query(
-    'SELECT start_time, end_time FROM availability WHERE day_of_week = ?',
-    [dayOfWeek]
+    'SELECT start_time, end_time FROM availability WHERE admin_id = ? AND day_of_week = ?',
+    [adminId, dayOfWeek]
   );
 
   const [bookingRows] = await executor.query(
     {
-      sql: "SELECT scheduled_at, duration_min FROM bookings WHERE status = 'booked' AND scheduled_at >= ? AND scheduled_at < ?",
+      sql: "SELECT scheduled_at, duration_min FROM bookings WHERE admin_id = ? AND status = 'booked' AND scheduled_at >= ? AND scheduled_at < ?",
       dateStrings: ['DATETIME']
     },
-    [toMysqlDatetime(dayStartUtc.toISOString()), toMysqlDatetime(dayEndUtc.toISOString())]
+    [adminId, toMysqlDatetime(dayStartUtc.toISOString()), toMysqlDatetime(dayEndUtc.toISOString())]
   );
 
   const bookedIntervals = bookingRows.map((row) => {
@@ -121,14 +133,64 @@ async function computeOpenSlots(executor, date) {
   return openSlots;
 }
 
-async function fetchScopedBookings(user, { status, upcoming, hoursAhead } = {}) {
-  const conditions = [];
-  const params = [];
+// Detects whether a proposed booking OVERLAPS an existing one on the same
+// teacher's calendar.
+//
+// The uq_bookings_admin_id_active_scheduled_at unique index (migration 0021)
+// only catches bookings that share an EXACT start instant. It cannot express
+// interval overlap: a 60-minute session at 09:00 and a 30-minute session at
+// 09:30 have different scheduled_at values, satisfy the index, and still
+// collide in reality. No unique index can express this -- it has to be a
+// query.
+//
+// MUST be called inside the same transaction as the INSERT, with FOR UPDATE,
+// so two simultaneous requests cannot both pass this check before either
+// inserts. FOR UPDATE makes the second request block until the first commits,
+// at which point it sees the new row.
+//
+// Standard half-open interval overlap: newStart < existingEnd AND existingStart < newEnd.
+async function findOverlappingBooking(connection, { adminId, startIsoUtc, durationMin }) {
+  const startUtc = toMysqlDatetime(startIsoUtc);
+  const endUtc = toMysqlDatetime(
+    new Date(new Date(startIsoUtc).getTime() + durationMin * 60000).toISOString()
+  );
 
-  if (user.role === 'student') {
-    conditions.push('b.student_id = ?');
-    params.push(user.id);
-  }
+  const [rows] = await connection.query(
+    {
+      sql: `SELECT id, scheduled_at, duration_min
+              FROM bookings
+             WHERE admin_id = ?
+               AND status = 'booked'
+               AND scheduled_at < ?
+               AND DATE_ADD(scheduled_at, INTERVAL duration_min MINUTE) > ?
+             LIMIT 1
+             FOR UPDATE`,
+      dateStrings: ['DATETIME']
+    },
+    [adminId, endUtc, startUtc]
+  );
+
+  return rows[0] || null;
+}
+
+async function fetchScopedBookings(user, { status, upcoming, hoursAhead } = {}) {
+  // Column names are qualified with the `b` alias used by the query below.
+  // An admin sees only bookings on their own calendar; an owner sees every
+  // booking in their organization; a student sees only their own. A manager
+  // is rejected by scopeFor -- bookings are per-student detail, not aggregate
+  // data.
+  //
+  // Previously this scoped negatively ("if student, filter; otherwise return
+  // every booking in the table"), which would have shown one teacher every
+  // other teacher's calendar. See utils/scope.js.
+  const scope = scopeFor(user, {
+    org: 'b.org_id',
+    admin: 'b.admin_id',
+    student: 'b.student_id'
+  });
+
+  const conditions = [scope.sql];
+  const params = [...scope.params];
 
   if (status) {
     conditions.push('b.status = ?');
@@ -147,7 +209,9 @@ async function fetchScopedBookings(user, { status, upcoming, hoursAhead } = {}) 
     }
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  // `conditions` always holds at least the tenancy predicate, so the
+  // "no WHERE clause at all" case that produced an unscoped query cannot occur.
+  const where = `WHERE ${conditions.join(' AND ')}`;
   const [rows] = await pool.query(
     {
       sql: `SELECT b.*, u.name AS student_name
@@ -196,6 +260,7 @@ function serializeBooking(row) {
 }
 
 module.exports = {
+  findOverlappingBooking,
   toMysqlDatetime,
   computeOpenSlots,
   fetchScopedBookings,

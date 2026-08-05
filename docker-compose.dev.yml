@@ -1,9 +1,33 @@
 # =============================================================================
-# Student CRM — Local Dev MySQL (Phase 0)
+# Student CRM — Local Dev Database (Phase 0)
 # =============================================================================
-# Purpose: spin up a local MySQL 8.0 instance for development only. This file
-# is NOT used in production — the VPS runs a native MySQL install per the
-# project's current deploy approach.
+# Purpose: spin up a local database for development only. This file is NOT
+# used in production.
+#
+# ENGINE: MariaDB 11.8, deliberately matching production.
+#
+# This image was `mysql:8.0` until the multi-tenant work. That was a latent
+# bug generator: production is a Hostinger-managed database running MariaDB
+# 11.8 (confirmed via SELECT VERSION() while applying
+# 0012_survey_responses_per_student.sql — see that file's header), so
+# MySQL-only syntax passed every local test and then failed on the live host.
+# 0012 hit exactly that, with errno 121 on a batched multi-clause ALTER.
+#
+# The three divergences that bite this schema:
+#   - Generated columns: MySQL spells it STORED, MariaDB spells it PERSISTENT.
+#   - MariaDB cannot build an index on a VIRTUAL generated column at all;
+#     0009_create_bookings.sql declared exactly that (UNIQUE on a VIRTUAL
+#     column), which is valid MySQL 8 and invalid MariaDB.
+#   - MariaDB reproducibly rejects certain batched multi-clause ALTER TABLE
+#     statements that MySQL accepts (0012's errno 121).
+#
+# Keep this image pinned to the same major version as production. If the
+# production host ever changes engine, change it here in the same commit.
+#
+# NOTE: the ./docker-data volume is engine-specific. A volume previously
+# written by mysql:8.0 CANNOT be read by MariaDB — remove it and re-run
+# `npm run migrate` against an empty database. Local dev data only;
+# production is untouched by anything in this file.
 #
 # Credential source of truth: .env in this same directory (this compose file
 # lives at the server repo's root). Compose's `${VAR}` interpolation below
@@ -21,8 +45,12 @@
 # =============================================================================
 
 services:
+  # Service key stays `mysql` (not `mariadb`) so `npm run db:up` / `db:down`
+  # and any existing container references keep working unchanged. MariaDB's
+  # image honours the same MYSQL_* environment variables and the same
+  # /var/lib/mysql data path, so only the image tag differs.
   mysql:
-    image: mysql:8.0
+    image: mariadb:11.8
     container_name: student_crm_mysql_dev
     restart: unless-stopped
     environment:

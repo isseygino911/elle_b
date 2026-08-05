@@ -1,7 +1,8 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { requireRole, requireAuth } = require('../middleware/auth');
+const { requireAuth, requireCapability } = require('../middleware/auth');
+const { CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { validateBody, validateParams, validateQuery } = require('../middleware/validate');
 const {
   uploadUrlRequestSchema,
@@ -22,14 +23,26 @@ const {
 } = require('../constants/library');
 const s3 = require('../services/s3');
 const { sanitizeFilename } = require('../utils/sanitizeFilename');
-const { serializeFile, serializeCategory, assertCategoryExists } = require('./library.helpers');
+const {
+  serializeFile,
+  serializeCategory,
+  assertCategoryInScope,
+  orgFence
+} = require('./library.helpers');
 
 const router = express.Router();
 
-// Read access (list/get/download) is open to any authenticated user — the
-// library is a shared shelf of teaching resources. Everything that mutates
-// it (uploading, filing, renaming, deleting) is Elle-only, so each mutating
-// route below carries requireRole('elle') rather than requireAuth().
+// Read access (list/get/download) is open to any authenticated user IN THE
+// CALLER'S ORGANIZATION — the library is a shared shelf of teaching resources,
+// so students and managers read it too. Everything that mutates it (uploading,
+// filing, renaming, deleting) carries requireCapability(CAN_READ_STUDENT_DETAIL)
+// rather than requireAuth().
+//
+// "Any authenticated user" is a statement about ROLE, never about tenancy.
+// Every query in this file — read and write alike — is fenced with orgFence(),
+// because these tables carry org_id and a missing predicate would make the
+// shelf global rather than per-organization. See library.helpers.js for why
+// this uses a plain org_id predicate instead of scopeFor().
 
 // --- Categories -----------------------------------------------------------
 
@@ -37,19 +50,25 @@ router.get('/categories', requireAuth(), async (req, res, next) => {
   try {
     // LEFT JOIN so a category with no files still reports file_count 0,
     // which the UI needs to render an empty category rather than hide it.
+    // The join is fenced too, not just the outer query: file_count must never
+    // count another organization's file, even though the FK makes that
+    // unlikely.
     const [rows] = await pool.query(
       `SELECT c.*, COUNT(f.id) AS file_count
          FROM library_categories c
-         LEFT JOIN library_files f ON f.category_id = c.id
+         LEFT JOIN library_files f ON f.category_id = c.id AND f.org_id = ?
+        WHERE c.org_id = ?
         GROUP BY c.id
-        ORDER BY c.name ASC`
+        ORDER BY c.name ASC`,
+      [req.user.orgId, req.user.orgId]
     );
 
     // The count of files filed nowhere, surfaced alongside the real
     // categories so the client can render an "Uncategorized" bucket without
     // fetching the whole file list to compute it.
     const [[{ count: uncategorizedCount }]] = await pool.query(
-      'SELECT COUNT(*) AS count FROM library_files WHERE category_id IS NULL'
+      'SELECT COUNT(*) AS count FROM library_files WHERE category_id IS NULL AND org_id = ?',
+      [req.user.orgId]
     );
 
     res.status(200).json({
@@ -63,18 +82,19 @@ router.get('/categories', requireAuth(), async (req, res, next) => {
 
 router.post(
   '/categories',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateBody(createCategorySchema),
   async (req, res, next) => {
     try {
       const [result] = await pool.query(
-        'INSERT INTO library_categories (name, created_by) VALUES (?, ?)',
-        [req.body.name, req.user.id]
+        'INSERT INTO library_categories (org_id, name, created_by) VALUES (?, ?, ?)',
+        [req.user.orgId, req.body.name, req.user.id]
       );
 
-      const [rows] = await pool.query('SELECT * FROM library_categories WHERE id = ?', [
-        result.insertId
-      ]);
+      const [rows] = await pool.query(
+        'SELECT * FROM library_categories WHERE id = ? AND org_id = ?',
+        [result.insertId, req.user.orgId]
+      );
 
       res.status(201).json({ category: serializeCategory(rows[0]) });
     } catch (err) {
@@ -90,23 +110,27 @@ router.post(
 
 router.patch(
   '/categories/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(categoryIdParamSchema),
   validateBody(updateCategorySchema),
   async (req, res, next) => {
     try {
-      const [result] = await pool.query('UPDATE library_categories SET name = ? WHERE id = ?', [
-        req.body.name,
-        req.params.id
-      ]);
+      // The fence rides on the UPDATE, so affectedRows === 0 covers both "no
+      // such category" and "another organization's category" without telling
+      // the caller which.
+      const [result] = await pool.query(
+        'UPDATE library_categories SET name = ? WHERE id = ? AND org_id = ?',
+        [req.body.name, req.params.id, req.user.orgId]
+      );
 
       if (result.affectedRows === 0) {
         return res.status(404).json({ status: 'error', message: 'Category not found' });
       }
 
-      const [rows] = await pool.query('SELECT * FROM library_categories WHERE id = ?', [
-        req.params.id
-      ]);
+      const [rows] = await pool.query(
+        'SELECT * FROM library_categories WHERE id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
+      );
 
       res.status(200).json({ category: serializeCategory(rows[0]) });
     } catch (err) {
@@ -124,18 +148,19 @@ router.patch(
 // NULL, so they fall back to "Uncategorized" and stay browsable/re-filable.
 router.delete(
   '/categories/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(categoryIdParamSchema),
   async (req, res, next) => {
     try {
       const [[{ count: fileCount }]] = await pool.query(
-        'SELECT COUNT(*) AS count FROM library_files WHERE category_id = ?',
-        [req.params.id]
+        'SELECT COUNT(*) AS count FROM library_files WHERE category_id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
       );
 
-      const [result] = await pool.query('DELETE FROM library_categories WHERE id = ?', [
-        req.params.id
-      ]);
+      const [result] = await pool.query(
+        'DELETE FROM library_categories WHERE id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
+      );
 
       if (result.affectedRows === 0) {
         return res.status(404).json({ status: 'error', message: 'Category not found' });
@@ -152,7 +177,7 @@ router.delete(
 
 router.post(
   '/upload-url',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateBody(uploadUrlRequestSchema),
   async (req, res, next) => {
     try {
@@ -186,11 +211,11 @@ router.post(
   }
 );
 
-router.post('/files', requireRole('elle'), validateBody(createFileSchema), async (req, res, next) => {
+router.post('/files', requireCapability(CAN_READ_STUDENT_DETAIL), validateBody(createFileSchema), async (req, res, next) => {
   try {
     const categoryId = req.body.category_id ?? null;
 
-    if (!(await assertCategoryExists(res, categoryId))) {
+    if (!(await assertCategoryInScope(res, req.user, categoryId))) {
       return;
     }
 
@@ -222,9 +247,10 @@ router.post('/files', requireRole('elle'), validateBody(createFileSchema), async
     try {
       const [insertResult] = await pool.query(
         `INSERT INTO library_files
-           (category_id, title, original_filename, s3_key, content_type, size_bytes, description, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (org_id, category_id, title, original_filename, s3_key, content_type, size_bytes, description, uploaded_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
+          req.user.orgId,
           categoryId,
           title,
           originalFilename,
@@ -240,8 +266,8 @@ router.post('/files', requireRole('elle'), validateBody(createFileSchema), async
         `SELECT f.*, c.name AS category_name
            FROM library_files f
            LEFT JOIN library_categories c ON c.id = f.category_id
-          WHERE f.id = ?`,
-        [insertResult.insertId]
+          WHERE f.id = ? AND f.org_id = ?`,
+        [insertResult.insertId, req.user.orgId]
       );
 
       res.status(201).json({ file: serializeFile(rows[0]) });
@@ -260,8 +286,13 @@ router.post('/files', requireRole('elle'), validateBody(createFileSchema), async
 
 router.get('/files', requireAuth(), validateQuery(listFilesQuerySchema), async (req, res, next) => {
   try {
-    const conditions = [];
-    const params = [];
+    // Seeded with the tenancy predicate, so `conditions` is never empty and
+    // the query can never degrade to "every file in the database". Without
+    // this, a request with no filters produced a WHERE-less SELECT and ?q=
+    // became a cross-tenant search.
+    const fence = orgFence(req.user, 'f.org_id');
+    const conditions = [fence.sql];
+    const params = [...fence.params];
 
     if (req.query.category_id === 'uncategorized') {
       conditions.push('f.category_id IS NULL');
@@ -278,13 +309,11 @@ router.get('/files', requireAuth(), validateQuery(listFilesQuerySchema), async (
       params.push(term, term);
     }
 
-    let query = `SELECT f.*, c.name AS category_name
-                   FROM library_files f
-                   LEFT JOIN library_categories c ON c.id = f.category_id`;
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
-    }
-    query += ' ORDER BY f.created_at DESC';
+    const query = `SELECT f.*, c.name AS category_name
+                     FROM library_files f
+                     LEFT JOIN library_categories c ON c.id = f.category_id
+                    WHERE ${conditions.join(' AND ')}
+                    ORDER BY f.created_at DESC`;
 
     const [rows] = await pool.query(query, params);
 
@@ -300,8 +329,8 @@ router.get('/files/:id', requireAuth(), validateParams(fileIdParamSchema), async
       `SELECT f.*, c.name AS category_name
          FROM library_files f
          LEFT JOIN library_categories c ON c.id = f.category_id
-        WHERE f.id = ?`,
-      [req.params.id]
+        WHERE f.id = ? AND f.org_id = ?`,
+      [req.params.id, req.user.orgId]
     );
 
     if (rows.length === 0) {
@@ -322,7 +351,13 @@ function signedUrlHandler(mode) {
 
   return async (req, res, next) => {
     try {
-      const [rows] = await pool.query('SELECT * FROM library_files WHERE id = ?', [req.params.id]);
+      // Fenced before the S3 object is touched: an unfenced load here would
+      // mint a working signed URL for — or delete — another organization's
+      // object.
+      const [rows] = await pool.query(
+        'SELECT * FROM library_files WHERE id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
+      );
       const file = rows[0];
 
       if (!file) {
@@ -371,14 +406,15 @@ router.get(
 // the record back to "Uncategorized".
 router.patch(
   '/files/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(fileIdParamSchema),
   validateBody(updateFileSchema),
   async (req, res, next) => {
     try {
-      const [existingRows] = await pool.query('SELECT id FROM library_files WHERE id = ?', [
-        req.params.id
-      ]);
+      const [existingRows] = await pool.query(
+        'SELECT id FROM library_files WHERE id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
+      );
 
       if (existingRows.length === 0) {
         return res.status(404).json({ status: 'error', message: 'File not found' });
@@ -393,7 +429,7 @@ router.patch(
 
       if (Object.prototype.hasOwnProperty.call(req.body, 'category_id')) {
         const categoryId = req.body.category_id ?? null;
-        if (!(await assertCategoryExists(res, categoryId))) {
+        if (!(await assertCategoryInScope(res, req.user, categoryId))) {
           return;
         }
         updates.push('category_id = ?');
@@ -410,15 +446,28 @@ router.patch(
         params.push(req.body.description ?? null);
       }
 
-      params.push(req.params.id);
-      await pool.query(`UPDATE library_files SET ${updates.join(', ')} WHERE id = ?`, params);
+      // Defence in depth: updateFileSchema's .refine already rejects a body
+      // with no updatable field, so this is unreachable today. It exists so
+      // that adding a field to the schema without handling it here fails as a
+      // clean 400 rather than emitting `SET  WHERE` and a 500.
+      if (updates.length === 0) {
+        return res
+          .status(400)
+          .json({ status: 'error', message: 'Provide at least one field to update' });
+      }
+
+      params.push(req.params.id, req.user.orgId);
+      await pool.query(
+        `UPDATE library_files SET ${updates.join(', ')} WHERE id = ? AND org_id = ?`,
+        params
+      );
 
       const [rows] = await pool.query(
         `SELECT f.*, c.name AS category_name
            FROM library_files f
            LEFT JOIN library_categories c ON c.id = f.category_id
-          WHERE f.id = ?`,
-        [req.params.id]
+          WHERE f.id = ? AND f.org_id = ?`,
+        [req.params.id, req.user.orgId]
       );
 
       res.status(200).json({ file: serializeFile(rows[0]) });
@@ -430,11 +479,17 @@ router.patch(
 
 router.delete(
   '/files/:id',
-  requireRole('elle'),
+  requireCapability(CAN_READ_STUDENT_DETAIL),
   validateParams(fileIdParamSchema),
   async (req, res, next) => {
     try {
-      const [rows] = await pool.query('SELECT * FROM library_files WHERE id = ?', [req.params.id]);
+      // Fenced before the S3 object is touched: an unfenced load here would
+      // mint a working signed URL for — or delete — another organization's
+      // object.
+      const [rows] = await pool.query(
+        'SELECT * FROM library_files WHERE id = ? AND org_id = ?',
+        [req.params.id, req.user.orgId]
+      );
       const file = rows[0];
 
       if (!file) {
@@ -449,7 +504,10 @@ router.delete(
         console.error('S3 deleteLibraryObject failed:', err);
       }
 
-      await pool.query('DELETE FROM library_files WHERE id = ?', [file.id]);
+      await pool.query('DELETE FROM library_files WHERE id = ? AND org_id = ?', [
+        file.id,
+        req.user.orgId
+      ]);
 
       res.status(200).json({ status: 'ok' });
     } catch (err) {

@@ -22,6 +22,7 @@
 // scale.
 
 const pool = require('../db/pool');
+const { scopeFor } = require('../utils/scope');
 
 // One survey_questions<->survey_answers join, computed once and reused by
 // both functions below -- the single source of truth for "how many
@@ -31,31 +32,45 @@ const pool = require('../db/pool');
 // -- a string, not a number, since mysql2 doesn't assume it's safe to
 // auto-convert. CAST(... AS UNSIGNED) forces MySQL to return a plain
 // integer type instead, which mysql2 does convert to a JS number.
-async function getSurveyTotals() {
+//
+// `orgId` fences this to one organization's curriculum. Without it the totals
+// spanned every tenant: other organizations' survey TITLES leaked into the
+// scores response, and -- worse -- their questions inflated the denominator in
+// computeAllStudentsProgress, so every student's completion ratio read far
+// lower than reality.
+async function getSurveyTotals(orgId) {
   const [rows] = await pool.query(
     `SELECT sq.survey_id, s.title, s.title_zh, COUNT(*) AS total_questions,
             CAST(SUM(sq.points) AS UNSIGNED) AS total_points
      FROM survey_questions sq
      JOIN surveys s ON s.id = sq.survey_id
-     WHERE EXISTS (SELECT 1 FROM survey_answers sa WHERE sa.question_id = sq.id)
-     GROUP BY sq.survey_id, s.title, s.title_zh`
+     WHERE s.org_id = ?
+       AND EXISTS (SELECT 1 FROM survey_answers sa WHERE sa.question_id = sq.id)
+     GROUP BY sq.survey_id, s.title, s.title_zh`,
+    [orgId]
   );
   return rows;
 }
 
 // This student's progress broken out per survey -- used by the Students
 // detail page.
-async function computeStudentSurveyScores(studentId) {
-  const surveyTotals = await getSurveyTotals();
+//
+// `orgId` is the STUDENT's org, which assertStudentInScope has already proved
+// equal to the caller's before this runs.
+async function computeStudentSurveyScores(studentId, orgId) {
+  const surveyTotals = await getSurveyTotals(orgId);
 
+  // survey_responses deliberately has no org_id (migration 0023) -- the fence
+  // comes from joining through surveys instead, so the two can never disagree.
   const [responseRows] = await pool.query(
-    `SELECT survey_id, COUNT(DISTINCT question_id) AS completed_questions,
-            CAST(SUM(points_earned) AS UNSIGNED) AS earned_points,
-            MAX(submitted_at) AS last_submitted_at
-     FROM survey_responses
-     WHERE student_id = ?
-     GROUP BY survey_id`,
-    [studentId]
+    `SELECT r.survey_id, COUNT(DISTINCT r.question_id) AS completed_questions,
+            CAST(SUM(r.points_earned) AS UNSIGNED) AS earned_points,
+            MAX(r.submitted_at) AS last_submitted_at
+     FROM survey_responses r
+     JOIN surveys s ON s.id = r.survey_id
+     WHERE r.student_id = ? AND s.org_id = ?
+     GROUP BY r.survey_id`,
+    [studentId, orgId]
   );
   const responsesBySurveyId = new Map(responseRows.map((row) => [row.survey_id, row]));
 
@@ -78,23 +93,43 @@ async function computeStudentSurveyScores(studentId) {
 // the Students list panel and the dashboard's student_progress widget.
 // Sorted ascending by completion ratio so the students furthest behind
 // surface first.
-async function computeAllStudentsProgress() {
-  const surveyTotals = await getSurveyTotals();
+// `user` scopes the roster: an admin sees only their own students, an owner
+// the whole organization. Previously this selected EVERY student row in the
+// database with no predicate at all, which under multi-tenancy would have
+// shown one organization's progress table to another's.
+async function computeAllStudentsProgress(user) {
+  const surveyTotals = await getSurveyTotals(user.orgId);
   const totalQuestions = surveyTotals.reduce((sum, survey) => sum + survey.total_questions, 0);
   const totalPoints = surveyTotals.reduce((sum, survey) => sum + survey.total_points, 0);
 
+  const scope = scopeFor(user, { org: 'org_id', admin: 'admin_id' });
   const [studentRows] = await pool.query(
-    "SELECT id, name FROM users WHERE role = 'student' ORDER BY name"
+    `SELECT id, name FROM users WHERE role = 'student' AND ${scope.sql} ORDER BY name`,
+    scope.params
   );
 
-  const [responseRows] = await pool.query(
-    `SELECT student_id, COUNT(DISTINCT question_id) AS completed_questions,
-            CAST(SUM(points_earned) AS UNSIGNED) AS earned_points,
-            MAX(submitted_at) AS last_submitted_at
-     FROM survey_responses
-     GROUP BY student_id`
-  );
-  const responsesByStudentId = new Map(responseRows.map((row) => [row.student_id, row]));
+  // Restricted to the scoped students AND this org's surveys. Previously this
+  // had no WHERE clause at all: it aggregated every response row in the
+  // database on every call, and a student's numerator counted answers to
+  // surveys outside their own organization.
+  //
+  // The empty guard is not theoretical -- a newly invited teacher has no
+  // students yet, and mysql2 renders an empty array as `IN ()`, a syntax
+  // error.
+  let responsesByStudentId = new Map();
+  if (studentRows.length > 0) {
+    const [responseRows] = await pool.query(
+      `SELECT r.student_id, COUNT(DISTINCT r.question_id) AS completed_questions,
+              CAST(SUM(r.points_earned) AS UNSIGNED) AS earned_points,
+              MAX(r.submitted_at) AS last_submitted_at
+       FROM survey_responses r
+       JOIN surveys s ON s.id = r.survey_id
+       WHERE s.org_id = ? AND r.student_id IN (?)
+       GROUP BY r.student_id`,
+      [user.orgId, studentRows.map((row) => row.id)]
+    );
+    responsesByStudentId = new Map(responseRows.map((row) => [row.student_id, row]));
+  }
 
   const progress = studentRows.map((student) => {
     const response = responsesByStudentId.get(student.id);

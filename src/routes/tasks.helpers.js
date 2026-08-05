@@ -1,8 +1,13 @@
 // Shared by tasks.route.js's GET / and dashboard.route.js's tasks section, so
-// the role-scoping rule (elle sees all tasks, a student sees only tasks
-// assigned to them) lives in exactly one place.
+// the role-scoping rule lives in exactly one place.
+//
+// Scoping is delegated to utils/scope.js. This function previously scoped
+// NEGATIVELY -- "if student, filter by assigned_to; otherwise no WHERE clause
+// at all" -- which silently granted every non-student role every task in the
+// database. See utils/scope.js's header for why that shape was removed.
 
 const pool = require('../db/pool');
+const { scopeFor } = require('../utils/scope');
 
 // mysql2 returns DATE columns as JS Date objects (constructed at local
 // midnight in the server's timezone), which would otherwise implicitly
@@ -41,21 +46,27 @@ function serializeTask(row) {
 }
 
 async function fetchScopedTasks(user, statusFilter) {
-  const conditions = [];
-  const params = [];
+  // A task's owner is the student it is assigned to. Tasks have no admin_id
+  // column -- ownership is already expressed by created_by/assigned_to, and
+  // org_id is the tenancy fence (see migration 0023) -- so an admin sees every
+  // task in their organization rather than only their own students'.
+  const scope = scopeFor(user, { org: 'org_id', student: 'assigned_to' });
 
-  if (user.role === 'student') {
-    conditions.push('assigned_to = ?');
-    params.push(user.id);
-  }
+  // Always at least one condition, so the `conditions.length ? ... : ''`
+  // branch that used to produce a completely unscoped query is gone by
+  // construction.
+  const conditions = [scope.sql];
+  const params = [...scope.params];
 
   if (statusFilter) {
     conditions.push('status = ?');
     params.push(statusFilter);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  const [rows] = await pool.query(`SELECT * FROM tasks ${where} ORDER BY created_at ASC`, params);
+  const [rows] = await pool.query(
+    `SELECT * FROM tasks WHERE ${conditions.join(' AND ')} ORDER BY created_at ASC`,
+    params
+  );
   return rows;
 }
 

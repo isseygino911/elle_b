@@ -12,7 +12,13 @@ const createBookingSchema = z.object({
 });
 
 const openSlotsQuerySchema = z.object({
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD')
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  // Whose calendar to show. Only meaningful for an owner, who has no calendar
+  // of their own -- a student's and a teacher's are derived from their own
+  // identity and this parameter is ignored for them. Validated in the route
+  // against "is an admin in the caller's organization"; it is never trusted
+  // as given.
+  admin_id: z.coerce.number().int().positive().optional()
 });
 
 const listBookingsQuerySchema = z.object({

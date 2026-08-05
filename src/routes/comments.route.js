@@ -1,11 +1,12 @@
 const express = require('express');
 const pool = require('../db/pool');
+const { CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { requireAuth } = require('../middleware/auth');
 const { validateBody, validateParams } = require('../middleware/validate');
 const { videoIdParamSchema } = require('../schemas/videos.schema');
 const { createCommentSchema } = require('../schemas/comments.schema');
 const { serializeVideo, loadAuthorizedVideo } = require('./videos.helpers');
-const { getElleUserId } = require('../utils/elleUser');
+const { resolveCounterparty } = require('../utils/counterparty');
 const { insertNotification } = require('./notifications.helpers');
 
 const router = express.Router({ mergeParams: true });
@@ -51,7 +52,14 @@ router.post(
         );
         commentId = insertResult.insertId;
 
-        if (req.user.role === 'elle') {
+        // A teacher (or owner) commenting marks the video reviewed; a student
+        // commenting does not. Uses the shared capability set rather than an
+        // inline role pair, so a role added later doesn't silently gain the
+        // ability to mark work reviewed.
+        //
+        // `video` came from loadAuthorizedVideo, which is org-fenced, so this
+        // can only ever touch a video the caller was already authorized for.
+        if (CAN_READ_STUDENT_DETAIL.has(req.user.role)) {
           await connection.query(
             "UPDATE videos SET status = 'reviewed' WHERE id = ? AND status = 'pending_review'",
             [video.id]
@@ -61,11 +69,13 @@ router.post(
         const [videoRows] = await connection.query('SELECT * FROM videos WHERE id = ?', [video.id]);
         videoRow = videoRows[0];
 
-        const recipientId =
-          req.user.role === 'elle' ? videoRow.student_id : await getElleUserId(connection);
+        const recipientId = await resolveCounterparty(connection, {
+          actor: req.user,
+          studentId: videoRow.student_id
+        });
 
         if (recipientId) {
-          await insertNotification(connection, { userId: recipientId, type: 'comment', refId: commentId });
+          await insertNotification(connection, { orgId: req.user.orgId, userId: recipientId, type: 'comment', refId: commentId });
         }
 
         await connection.commit();

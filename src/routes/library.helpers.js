@@ -35,17 +35,46 @@ function serializeCategory(row) {
   };
 }
 
-// Confirms a category_id references a real category before it's written to
-// a file row. The FK would reject a bad id anyway, but catching it here
-// turns an opaque ER_NO_REFERENCED_ROW into a clear 400. Returns true if
-// valid (or if categoryId is null/undefined, meaning "uncategorized",
-// which is always allowed), otherwise sends a 400 and returns false.
-async function assertCategoryExists(res, categoryId) {
+// The library's tenancy predicate.
+//
+// Deliberately NOT scopeFor(): the library is a shared shelf, readable by
+// everyone in the organization (library.route.js explains why), and scopeFor
+// would throw for two roles that legitimately belong here -- manager (it
+// hard-denies managers, but org curriculum is not per-student detail) and
+// student (it demands a `student` column these tables don't have). Both would
+// break. The tables carry org_id and nothing else, so org_id IS the whole
+// fence that is expressible here.
+//
+// If you are tempted to "fix" this by switching to scopeFor, read the two
+// paragraphs above first.
+function orgFence(user, column = 'org_id') {
+  return { sql: `${column} = ?`, params: [user.orgId] };
+}
+
+// Confirms a category_id references a real category IN THE CALLER'S
+// ORGANIZATION before it's written to a file row. The FK would reject a
+// nonexistent id anyway, but it would happily accept another organization's
+// category -- filing your file into their shelf. Returns true if valid (or if
+// categoryId is null/undefined, meaning "uncategorized", which is always
+// allowed), otherwise sends a 400 and returns false.
+//
+// DELIBERATELY RENAMED from assertCategoryExists rather than given an extra
+// parameter: an added param can be forgotten at a call site and silently keep
+// the old cross-org behaviour. The rename makes every caller fail loudly until
+// it's updated. Same reasoning as utils/students.js.
+//
+// 400 and not 404: the route was fine, the request BODY referenced something
+// out of scope. It also doesn't distinguish "not yours" from "doesn't exist",
+// so ids can't be enumerated across tenants.
+async function assertCategoryInScope(res, user, categoryId) {
   if (categoryId === null || categoryId === undefined) {
     return true;
   }
 
-  const [rows] = await pool.query('SELECT id FROM library_categories WHERE id = ?', [categoryId]);
+  const [rows] = await pool.query(
+    'SELECT id FROM library_categories WHERE id = ? AND org_id = ?',
+    [categoryId, user.orgId]
+  );
 
   if (rows.length === 0) {
     res.status(400).json({
@@ -58,4 +87,4 @@ async function assertCategoryExists(res, categoryId) {
   return true;
 }
 
-module.exports = { serializeFile, serializeCategory, assertCategoryExists };
+module.exports = { serializeFile, serializeCategory, assertCategoryInScope, orgFence };
