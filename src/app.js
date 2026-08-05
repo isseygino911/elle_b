@@ -16,6 +16,7 @@ const tasksRoute = require('./routes/tasks.route');
 const availabilityRoute = require('./routes/availability.route');
 const bookingsRoute = require('./routes/bookings.route');
 const studentsRoute = require('./routes/students.route');
+const libraryRoute = require('./routes/library.route');
 
 const app = express();
 
@@ -66,6 +67,7 @@ app.use('/tasks', tasksRoute);
 app.use('/availability', availabilityRoute);
 app.use('/bookings', bookingsRoute);
 app.use('/students', studentsRoute);
+app.use('/library', libraryRoute);
 
 // Fallback error handler — must be last, must have 4 args.
 app.use((err, req, res, _next) => {
