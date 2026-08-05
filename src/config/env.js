@@ -49,5 +49,22 @@ module.exports = {
   aws: {
     region: process.env.AWS_REGION,
     bucket: process.env.AWS_S3_BUCKET
+  },
+  // Outbound mail (password reset links). Deliberately NOT in REQUIRED_VARS:
+  // the app has to boot without mail credentials, both because they don't
+  // exist yet and because a mail misconfiguration should degrade sending, not
+  // take the whole API down. src/utils/mailer.js treats "no user/password" as
+  // "no transport configured" and says so explicitly at startup.
+  smtp: {
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: Number(process.env.SMTP_PORT) || 587,
+    user: process.env.SMTP_USER || '',
+    // For Gmail this is a 16-character App Password, never the account
+    // password — see .env.example.
+    password: process.env.SMTP_PASSWORD || '',
+    // What recipients see in the From: header. Falls back to the auth user,
+    // since Gmail rejects a From that isn't the authenticated account (or one
+    // of its verified aliases) anyway.
+    from: process.env.MAIL_FROM || process.env.SMTP_USER || ''
   }
 };

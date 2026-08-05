@@ -42,10 +42,34 @@ const loginSchema = z.object({
   password: z.string().min(1).max(255)
 });
 
+const forgotPasswordSchema = z.object({
+  email: z.string().trim().email().max(255)
+});
+
+// The token travels in the body, not the URL path, so it stays out of server
+// access logs and browser history on submit.
+//
+// Password minimum matches registration (8). Deliberately the same rule: a
+// reset that accepted a weaker password than signup would be a way to
+// downgrade an account's protection rather than restore it.
+const resetPasswordSchema = z.object({
+  token: z.string().trim().length(64),
+  password: z.string().min(8).max(255)
+});
+
+// GET /auth/reset-password/:token — used by the reset page to check a link and
+// learn whose it is before showing the form.
+const resetTokenParamSchema = z.object({
+  token: z.string().trim().length(64)
+});
+
 module.exports = {
   createInvitationSchema,
   tokenParamSchema,
   registerSchema,
   registerOrganizationSchema,
-  loginSchema
+  loginSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  resetTokenParamSchema
 };

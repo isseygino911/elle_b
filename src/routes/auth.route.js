@@ -3,9 +3,23 @@ const argon2 = require('argon2');
 const pool = require('../db/pool');
 const config = require('../config/env');
 const { createAuthRateLimit } = require('../middleware/rateLimit');
-const { validateBody } = require('../middleware/validate');
-const { registerSchema, registerOrganizationSchema, loginSchema } = require('../schemas/auth.schema');
+const { validateBody, validateParams } = require('../middleware/validate');
+const {
+  registerSchema,
+  registerOrganizationSchema,
+  loginSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  resetTokenParamSchema
+} = require('../schemas/auth.schema');
 const { signAccessToken, signRefreshToken, verifyToken } = require('../utils/jwt');
+const {
+  findUserByEmail,
+  issueResetToken,
+  resolveResetToken,
+  redeemResetToken
+} = require('../utils/passwordReset');
+const { sendPasswordResetEmail } = require('../utils/mailer');
 
 const router = express.Router();
 
@@ -268,6 +282,106 @@ router.post('/refresh', async (req, res, next) => {
     next(err);
   }
 });
+
+// Request a reset link.
+//
+// ALWAYS responds 200 with the same body, whether or not the address matches
+// an account. The obvious alternative — 404 for an unknown email — turns this
+// into an account-existence oracle that anyone can query without
+// authenticating, which is worse than useless given users.email is globally
+// unique: it would confirm not just "is this person a customer" but "is this
+// address registered anywhere in the system".
+//
+// Rate-limited on the same basis as login: it sends mail and probes the user
+// table, both of which are worth throttling.
+router.post(
+  '/forgot-password',
+  createAuthRateLimit(),
+  validateBody(forgotPasswordSchema),
+  async (req, res, next) => {
+    try {
+      const user = await findUserByEmail(req.body.email);
+
+      if (user) {
+        const { token } = await issueResetToken(user.id);
+        // Awaited so a transport failure is caught here rather than surfacing
+        // as an unhandled rejection. The response does not depend on it.
+        await sendPasswordResetEmail({ to: user.email, name: user.name, token });
+      }
+
+      res.status(200).json({
+        status: 'ok',
+        message: 'If that email is registered, a reset link has been sent.'
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// Check a reset link before showing the form, and report whose it is.
+//
+// Returning name and role is what lets the reset page greet the user and say
+// what kind of account they are restoring, without the person having to
+// re-enter an email the token already identifies. Only ever reached by
+// someone already holding the token, which is itself the credential — so this
+// discloses nothing they could not learn by completing the reset.
+//
+// Deliberately NOT returning the email address: a reset link that leaks from
+// a forwarded mail or a shared screen would otherwise hand over the account's
+// login identifier as well.
+router.get(
+  '/reset-password/:token',
+  validateParams(resetTokenParamSchema),
+  async (req, res, next) => {
+    try {
+      const resolved = await resolveResetToken(req.params.token);
+
+      if (!resolved) {
+        return res.status(200).json({ valid: false });
+      }
+
+      res.status(200).json({
+        valid: true,
+        name: resolved.name,
+        role: resolved.role
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// Complete the reset.
+//
+// No tokens are issued here and the user is not logged in as a side effect:
+// they set a password and then use it, which matches how registration already
+// behaves in this app and means a reset link alone never becomes a live
+// session. Every other outstanding reset token for the account is burned
+// inside the same transaction (see redeemResetToken).
+router.post(
+  '/reset-password',
+  createAuthRateLimit(),
+  validateBody(resetPasswordSchema),
+  async (req, res, next) => {
+    try {
+      const user = await redeemResetToken(req.body.token, req.body.password);
+
+      if (!user) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'This reset link is invalid or has expired.'
+        });
+      }
+
+      // Role is echoed back so the client can route the user to the right
+      // place after they log in, without decoding anything itself.
+      res.status(200).json({ status: 'ok', role: user.role });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 router.post('/logout', (req, res) => {
   res.clearCookie(REFRESH_COOKIE_NAME, refreshCookieOptions);
