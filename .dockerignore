@@ -14,3 +14,20 @@ keys/
 logs/
 *.log
 .git
+.gitignore
+
+# Host-level deploy config. Caddy, PM2 and compose all run on the VPS itself,
+# never inside the API container. The Dockerfile now COPYs an explicit
+# allowlist so these are already excluded — keeping them here too means a
+# future `COPY . .` cannot silently reintroduce them.
+Caddyfile
+ecosystem.config.js
+docker-compose*.yml
+Dockerfile
+DEPLOY.md
+infra/
+docker-data/
+
+# Editor/agent state and OS cruft.
+.claude/
+.DS_Store
