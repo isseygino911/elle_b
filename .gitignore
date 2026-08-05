@@ -30,3 +30,6 @@ Thumbs.db
 # --- Editor ---
 .vscode/
 .idea/
+
+# --- Agent tooling ---
+.claude/
