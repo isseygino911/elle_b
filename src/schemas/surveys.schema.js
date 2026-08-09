@@ -24,6 +24,19 @@ const surveyDetailQuerySchema = z.object({
     .optional()
 });
 
+// GET /:id/export renders ONE student's filled survey, so student_id is
+// required here — unlike surveyDetailQuerySchema, where it's an optional
+// drill-in on a page a student also reads for themselves.
+//
+// `language` picks between the English text and its _zh sibling column
+// (migration 0013) in the rendered document, mirroring the client's language
+// toggle. Defaulted rather than required so a caller that omits it gets
+// English instead of a validation error.
+const surveyExportQuerySchema = z.object({
+  student_id: z.string().regex(/^\d+$/, 'student_id must be a numeric id'),
+  language: z.enum(['en', 'zh']).optional()
+});
+
 const numericId = z
   .union([z.number().int().positive(), z.string().regex(/^\d+$/, 'must be a numeric id')])
   .transform(Number);
@@ -57,5 +70,6 @@ module.exports = {
   surveyIdParamSchema,
   surveyQuestionParamsSchema,
   surveyDetailQuerySchema,
+  surveyExportQuerySchema,
   submitRatingsSchema
 };

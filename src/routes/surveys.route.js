@@ -10,9 +10,11 @@ const {
   surveyIdParamSchema,
   surveyQuestionParamsSchema,
   surveyDetailQuerySchema,
+  surveyExportQuerySchema,
   submitRatingsSchema
 } = require('../schemas/surveys.schema');
 const { parseSurveyXml, SurveyXmlError } = require('../services/surveyXmlParser');
+const { renderSurveyExportHtml } = require('../services/surveyExport');
 const s3 = require('../services/s3');
 const { sanitizeFilename } = require('../utils/sanitizeFilename');
 const { assertStudentInScope } = require('../utils/students');
@@ -517,6 +519,76 @@ router.get(
       }
 
       res.status(200).json({ url, expires_in: DOWNLOAD_URL_EXPIRES_IN_SECONDS });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// Downloads ONE student's filled-in survey as a printable HTML document —
+// every statement with its rating scale drawn out and the chosen number
+// filled in, the way the survey reads on screen.
+//
+// Distinct from GET /:id/download-url above, which hands back the ORIGINAL
+// uploaded XML from S3. That file is the blank survey and is identical for
+// every student; this is the student's answers, which exist only as
+// survey_responses rows and so have to be rendered on demand.
+//
+// requireCapability(CAN_READ_STUDENT_DETAIL) rather than requireAuth(): this
+// is one named student's answers, exactly the per-student surface a manager
+// must never read, and unlike GET /:id there is no student self-serve case to
+// accommodate — a student reads their own answers in the app. student_id is
+// therefore required, not optional, and still goes through
+// assertStudentInScope so an admin only ever reaches their own roster.
+//
+// The document is generated and streamed from Express rather than presigned
+// from S3 (the pattern the original-file download and the library use),
+// because it doesn't exist as an object: it's assembled per request from the
+// current response rows.
+router.get(
+  '/:id/export',
+  requireCapability(CAN_READ_STUDENT_DETAIL),
+  validateParams(surveyIdParamSchema),
+  validateQuery(surveyExportQuerySchema),
+  async (req, res, next) => {
+    try {
+      const survey = await loadAuthorizedSurvey(req, res);
+      if (!survey) {
+        return;
+      }
+
+      // Out of scope reads as absent, matching the survey load above and
+      // GET /:id's handling of the same parameter.
+      const student = await assertStudentInScope(req.user, req.query.student_id);
+      if (!student) {
+        return res.status(404).json({ status: 'error', message: 'Survey not found' });
+      }
+
+      const questions = await loadQuestionsWithAnswers(pool, survey.id, req.user.orgId);
+      const responsesByQuestionId = await loadResponsesByQuestionId(pool, survey.id, student.id);
+
+      const html = renderSurveyExportHtml({
+        survey,
+        student,
+        questions,
+        responsesByQuestionId,
+        language: req.query.language || 'en',
+        exportedAt: new Date().toISOString()
+      });
+
+      // Same Content-Disposition shape as s3.getLibraryObjectUrl: a quoted
+      // ASCII fallback for legacy clients plus RFC 5987 filename* so a
+      // non-ASCII survey title or student name survives into the save dialog
+      // instead of arriving percent-escaped.
+      const filename = `${survey.title} - ${student.name}.html`;
+      const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+      );
+      res.status(200).send(html);
     } catch (err) {
       next(err);
     }
