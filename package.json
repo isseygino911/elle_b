@@ -11,8 +11,10 @@
     "seed:elle": "node scripts/seed-elle.js",
     "seed:owner": "node scripts/seed-owner.js",
     "check:mail": "node scripts/check-mail.js",
-    "db:up": "docker compose --env-file ./.env -f docker-compose.dev.yml up -d",
-    "db:down": "docker compose --env-file ./.env -f docker-compose.dev.yml down"
+    "test": "node --import ./test/preload.js --test \"test/**/*.test.js\"",
+    "test:watch": "node --import ./test/preload.js --test --watch \"test/**/*.test.js\"",
+    "db:up": "docker compose --env-file ./.env.local.db -f docker-compose.dev.yml up -d",
+    "db:down": "docker compose --env-file ./.env.local.db -f docker-compose.dev.yml down"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",

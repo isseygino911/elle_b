@@ -58,6 +58,31 @@ const CAN_READ_AGGREGATES = Object.freeze(new Set([ROLES.OWNER, ROLES.MANAGER]))
 // utils/elleUser.js, which assumed exactly one teacher existed.
 const IS_TEACHER = Object.freeze(new Set([ROLES.ADMIN]));
 
+// Roles permitted to broadcast to the ENTIRE organization -- every teacher,
+// every student, or both. Owner only.
+//
+// Two separate sets rather than one CAN_BROADCAST plus a rank check inside the
+// route, because the difference between these is not seniority: it is which
+// recipient set the sender may address. A manager outranks an admin and is
+// absent from both, which is exactly the case a rank comparison would get
+// wrong.
+const CAN_BROADCAST_ORG = Object.freeze(new Set([ROLES.OWNER]));
+
+// Roles permitted to broadcast to their OWN roster -- the students whose
+// users.admin_id points at the sender. Nobody else's.
+//
+// Owner is deliberately absent: an owner owns no roster (users.admin_id never
+// points at them), so membership here would grant a capability with an empty
+// recipient set. Their reach comes from CAN_BROADCAST_ORG instead.
+const CAN_BROADCAST_ROSTER = Object.freeze(new Set([ROLES.ADMIN]));
+
+// Roles that receive an oversight copy of every teacher broadcast: sender,
+// message and recipient COUNT. Never names, never per-recipient read state.
+//
+// This is the manager's existing aggregate tier applied to a new event, not a
+// widening of it -- consistent with CAN_READ_AGGREGATES above.
+const CAN_READ_BROADCAST_OVERSIGHT = Object.freeze(new Set([ROLES.OWNER, ROLES.MANAGER]));
+
 // Returns 0 for an unknown role, so an unrecognized value can never satisfy
 // a minimum-rank check.
 function rankOf(role) {
@@ -70,5 +95,8 @@ module.exports = {
   rankOf,
   CAN_READ_STUDENT_DETAIL,
   CAN_READ_AGGREGATES,
+  CAN_BROADCAST_ORG,
+  CAN_BROADCAST_ROSTER,
+  CAN_READ_BROADCAST_OVERSIGHT,
   IS_TEACHER
 };

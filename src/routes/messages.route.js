@@ -4,7 +4,7 @@ const { requireAuth } = require('../middleware/auth');
 const { validateBody, validateParams } = require('../middleware/validate');
 const { studentIdParamSchema, sendMessageSchema } = require('../schemas/messages.schema');
 const { loadAuthorizedThread } = require('./messages.helpers');
-const { resolveCounterparty } = require('../utils/counterparty');
+const { resolveRecipients } = require('../utils/counterparty');
 const { insertNotification } = require('./notifications.helpers');
 
 // Mounted top-level at /messages (not nested under /students) — student_id
@@ -92,13 +92,41 @@ router.post(
         );
         messageId = insertResult.insertId;
 
-        const recipientId = await resolveCounterparty(connection, {
+        const recipients = await resolveRecipients(connection, {
           actor: req.user,
           studentId: thread.studentId
         });
 
-        if (recipientId) {
-          await insertNotification(connection, { orgId: req.user.orgId, userId: recipientId, type: 'message', refId: messageId });
+        for (const userId of recipients) {
+          await insertNotification(connection, {
+            orgId: req.user.orgId,
+            userId,
+            actorId: req.user.id,
+            type: 'message',
+            // No name interpolated here. req.user carries only id/orgId/role/
+            // adminId -- the middleware deliberately drops the token's `name`
+            // claim because it is client-supplied and untrusted. The actor's
+            // current name is joined at read time via actor_id instead, which
+            // is also correct when someone changes their name after the fact.
+            title: 'New message',
+            // Deliberately no message body here: the notification list is
+            // rendered in contexts a message thread is not, and copying
+            // private correspondence into a second table widens where it can
+            // be read from. The title says a message arrived; reading it means
+            // opening the thread.
+            body: null,
+            refId: messageId
+          });
+        }
+
+        if (recipients.length === 0) {
+          // An empty recipient set is legitimate -- there may be nobody left
+          // to tell -- but it is indistinguishable from successful delivery in
+          // the response, so it is logged rather than passing silently (BUG C).
+          console.warn(
+            `[notifications] message ${messageId} produced no recipients ` +
+              `(actor ${req.user.id}, role ${req.user.role}, student ${thread.studentId})`
+          );
         }
 
         await connection.commit();

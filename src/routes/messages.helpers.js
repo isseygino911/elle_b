@@ -27,6 +27,25 @@ async function loadAuthorizedThread(req, res) {
     return null;
   }
 
+  // A thread needs both sides. An unassigned student has no teacher, so there
+  // is no (student_id, admin_id) pair to write -- and messages.admin_id is
+  // NOT NULL by migration 0022, which means the INSERT fails at the database
+  // and surfaces as a 500. Sending a message as an unassigned student
+  // therefore crashed rather than degrading.
+  //
+  // Reported as 409 rather than 400: the request is well-formed, and the
+  // conflict is with the account's current state, which the caller cannot fix
+  // by changing the request. bookings.route.js rejects the same precondition
+  // at its own entry point; this puts the messages check in the equivalent
+  // place instead of letting it reach the driver.
+  if (!student.admin_id) {
+    res.status(409).json({
+      status: 'error',
+      message: 'That student is not assigned to a teacher yet'
+    });
+    return null;
+  }
+
   // adminId is the thread's teacher side: for a student it is their own
   // teacher, and for a teacher acting on their roster it is themselves.
   return { studentId: student.id, adminId: student.admin_id, orgId: student.org_id };

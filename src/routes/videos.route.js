@@ -24,6 +24,8 @@ const s3 = require('../services/s3');
 const { sanitizeFilename } = require('../utils/sanitizeFilename');
 const { serializeVideo, loadAuthorizedVideo } = require('./videos.helpers');
 const { assertStudentInScope } = require('../utils/students');
+const { resolveRecipients } = require('../utils/counterparty');
+const { insertNotification } = require('./notifications.helpers');
 
 const router = express.Router();
 
@@ -159,33 +161,93 @@ router.post(
         return res.status(400).json({ status: 'error', message: 'Uploaded file does not meet the requirements' });
       }
 
+      // Transactional as of Phase 2. This INSERT previously stood alone on the
+      // pool; now that recording a video also notifies the teacher, the row and
+      // its notification must commit together -- otherwise a failed notify
+      // leaves a video nobody is told about, which is precisely the bug this
+      // phase exists to close.
+      const connection = await pool.getConnection();
+      let videoId;
+
       try {
-        const [insertResult] = await pool.query(
-          `INSERT INTO videos (org_id, admin_id, type, student_id, title, s3_key, duration_sec, status, uploaded_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
-          [
-            req.user.orgId,
-            // The owning teacher: for a student uploader it is their own
-            // admin; for a teacher it is themselves. May be null for an
-            // org-level class video with no student (videos.admin_id is
-            // nullable by design -- see migration 0023).
-            resolved.adminId ?? null,
-            type, resolved.studentId, title, s3Key, durationSec ?? null, req.user.id
-          ]
-        );
+        await connection.beginTransaction();
 
-        const [videoRows] = await pool.query(
-          'SELECT * FROM videos WHERE id = ? AND org_id = ?',
-          [insertResult.insertId, req.user.orgId]
-        );
-
-        res.status(201).json({ video: serializeVideo(videoRows[0]) });
-      } catch (err) {
-        if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(409).json({ status: 'error', message: 'This upload has already been recorded.' });
+        try {
+          const [insertResult] = await connection.query(
+            `INSERT INTO videos (org_id, admin_id, type, student_id, title, s3_key, duration_sec, status, uploaded_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
+            [
+              req.user.orgId,
+              // The owning teacher: for a student uploader it is their own
+              // admin; for a teacher it is themselves. May be null for an
+              // org-level class video with no student (videos.admin_id is
+              // nullable by design -- see migration 0023).
+              resolved.adminId ?? null,
+              type, resolved.studentId, title, s3Key, durationSec ?? null, req.user.id
+            ]
+          );
+          videoId = insertResult.insertId;
+        } catch (err) {
+          if (err.code === 'ER_DUP_ENTRY') {
+            // Rolled back here rather than falling through to the outer
+            // handler: a duplicate s3_key is a legitimate client retry, not a
+            // server fault, and it must still release the transaction.
+            await connection.rollback();
+            return res.status(409).json({ status: 'error', message: 'This upload has already been recorded.' });
+          }
+          throw err;
         }
-        throw err;
+
+        // A practice video belongs to a student, and the person who needs to
+        // know it arrived is their teacher. resolveRecipients is the right
+        // helper here (unlike tasks): a video genuinely is a two-party
+        // student/teacher artefact, and when an owner uploads on a student's
+        // behalf the student's own teacher should hear about it too.
+        //
+        // studentId is null for a class video with no owning student, in which
+        // case there is nobody to notify and the upload simply succeeds.
+        const recipients = resolved.studentId
+          ? await resolveRecipients(connection, {
+              actor: req.user,
+              studentId: resolved.studentId
+            })
+          : [];
+
+        for (const userId of recipients) {
+          await insertNotification(connection, {
+            orgId: req.user.orgId,
+            userId,
+            actorId: req.user.id,
+            type: 'video_uploaded',
+            title: `New video: ${title}`,
+            body: null,
+            refId: videoId
+          });
+        }
+
+        if (recipients.length === 0) {
+          // Legitimate for an unassigned student or a class video with no
+          // student, but silent either way without this (BUG C's pattern).
+          console.warn(
+            `[notifications] video ${videoId} produced no recipients ` +
+              `(actor ${req.user.id}, role ${req.user.role}, student ${resolved.studentId})`
+          );
+        }
+
+        await connection.commit();
+      } catch (err) {
+        await connection.rollback();
+        return next(err);
+      } finally {
+        connection.release();
       }
+
+      const [videoRows] = await pool.query(
+        'SELECT * FROM videos WHERE id = ? AND org_id = ?',
+        [videoId, req.user.orgId]
+      );
+
+      res.status(201).json({ video: serializeVideo(videoRows[0]) });
     } catch (err) {
       next(err);
     }

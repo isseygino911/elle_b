@@ -6,7 +6,7 @@ const { validateBody, validateParams } = require('../middleware/validate');
 const { videoIdParamSchema } = require('../schemas/videos.schema');
 const { createCommentSchema } = require('../schemas/comments.schema');
 const { serializeVideo, loadAuthorizedVideo } = require('./videos.helpers');
-const { resolveCounterparty } = require('../utils/counterparty');
+const { resolveRecipients } = require('../utils/counterparty');
 const { insertNotification } = require('./notifications.helpers');
 
 const router = express.Router({ mergeParams: true });
@@ -59,23 +59,68 @@ router.post(
         //
         // `video` came from loadAuthorizedVideo, which is org-fenced, so this
         // can only ever touch a video the caller was already authorized for.
+        //
+        // affectedRows is the transition signal, and it is why the
+        // video_reviewed notification below fires exactly once: the
+        // `AND status = 'pending_review'` predicate matches no row on a second
+        // comment, so justReviewed is false and the student is not told their
+        // work was reviewed twice.
+        let justReviewed = false;
         if (CAN_READ_STUDENT_DETAIL.has(req.user.role)) {
-          await connection.query(
+          const [reviewResult] = await connection.query(
             "UPDATE videos SET status = 'reviewed' WHERE id = ? AND status = 'pending_review'",
             [video.id]
           );
+          justReviewed = reviewResult.affectedRows > 0;
         }
 
         const [videoRows] = await connection.query('SELECT * FROM videos WHERE id = ?', [video.id]);
         videoRow = videoRows[0];
 
-        const recipientId = await resolveCounterparty(connection, {
+        const recipients = await resolveRecipients(connection, {
           actor: req.user,
           studentId: videoRow.student_id
         });
 
-        if (recipientId) {
-          await insertNotification(connection, { orgId: req.user.orgId, userId: recipientId, type: 'comment', refId: commentId });
+        for (const userId of recipients) {
+          await insertNotification(connection, {
+            orgId: req.user.orgId,
+            userId,
+            actorId: req.user.id,
+            type: 'comment',
+            title: 'New comment on your video',
+            body: null,
+            refId: commentId
+          });
+        }
+
+        // Two distinct facts, deliberately two rows: somebody left feedback,
+        // and the video moved out of the review queue. They are not the same
+        // event -- a later comment is feedback without a status change -- and
+        // collapsing them would mean the student could never tell "reviewed"
+        // from "commented on again".
+        //
+        // ref_id points at the VIDEO, not the comment: this notification is
+        // about the video's state, so that is what it should deep-link to.
+        if (justReviewed && videoRow.student_id) {
+          await insertNotification(connection, {
+            orgId: req.user.orgId,
+            userId: videoRow.student_id,
+            actorId: req.user.id,
+            type: 'video_reviewed',
+            title: 'Your video was reviewed',
+            body: null,
+            refId: video.id
+          });
+        }
+
+        if (recipients.length === 0) {
+          // Legitimate for a class video with no owning student, but silent
+          // either way without this (BUG C).
+          console.warn(
+            `[notifications] comment ${commentId} produced no recipients ` +
+              `(actor ${req.user.id}, role ${req.user.role}, video ${video.id})`
+          );
         }
 
         await connection.commit();

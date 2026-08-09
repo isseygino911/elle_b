@@ -20,6 +20,7 @@ const {
   redeemResetToken
 } = require('../utils/passwordReset');
 const { sendPasswordResetEmail } = require('../utils/mailer');
+const { insertNotification } = require('./notifications.helpers');
 
 const router = express.Router();
 
@@ -104,6 +105,41 @@ router.post(
         `UPDATE invitations SET status = 'used', user_id = ? WHERE id = ?`,
         [userId, invitation.id]
       );
+
+      // The one notification on an unauthenticated path. There is no req.user
+      // here -- the actor is the account that has just this moment been
+      // created, and the recipient is whoever issued the invitation.
+      //
+      // Both org and recipient come from the invitation row read inside this
+      // transaction, never from the request: invitations.org_id is NOT NULL
+      // with an FK (migration 0023), and created_by is ON DELETE RESTRICT
+      // (0001), so the inviter provably still exists and provably belongs to
+      // the org whose invitation this is.
+      //
+      // Wrapped in its own try/catch, unlike every other call site. Elsewhere a
+      // failed notification SHOULD roll the triggering action back; here it
+      // must not. Registration is the one irreversible, user-facing action in
+      // the app -- the invitation token is single-use and the account is the
+      // point of the request -- so a notification defect must never be the
+      // reason someone cannot create their account. The insert is best-effort
+      // and logged; the registration stands.
+      try {
+        await insertNotification(connection, {
+          orgId: invitation.org_id,
+          userId: invitation.created_by,
+          actorId: userId,
+          type: 'invitation_accepted',
+          title: `${name} accepted your invitation`,
+          body: null,
+          refId: invitation.id
+        });
+      } catch (notifyErr) {
+        console.error(
+          `[notifications] invitation ${invitation.id} accepted by user ${userId} ` +
+            'but the notification could not be written:',
+          notifyErr
+        );
+      }
 
       await connection.commit();
 

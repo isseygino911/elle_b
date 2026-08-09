@@ -17,7 +17,7 @@ const {
   fetchScopedBookings,
   serializeBooking
 } = require('./bookings.helpers');
-const { resolveCounterparty } = require('../utils/counterparty');
+const { resolveRecipients } = require('../utils/counterparty');
 const { insertNotification } = require('./notifications.helpers');
 const { assertStudentInScope } = require('../utils/students');
 const { scopeFor } = require('../utils/scope');
@@ -162,9 +162,17 @@ router.post('/', requireAuth(), validateBody(createBookingSchema), async (req, r
       }
       bookingId = insertResult.insertId;
 
-      const recipientId = await resolveCounterparty(connection, { actor: req.user, studentId });
-      if (recipientId) {
-        await insertNotification(connection, { orgId: req.user.orgId, userId: recipientId, type: 'booking', refId: bookingId });
+      const recipients = await resolveRecipients(connection, { actor: req.user, studentId });
+      for (const userId of recipients) {
+        await insertNotification(connection, {
+          orgId: req.user.orgId,
+          userId,
+          actorId: req.user.id,
+          type: 'booking_created',
+          title: 'Lesson scheduled',
+          body: null,
+          refId: bookingId
+        });
       }
 
       await connection.commit();
@@ -236,12 +244,25 @@ router.patch(
 
         row = await loadBookingRow(connection, req.params.id);
 
-        const recipientId = await resolveCounterparty(connection, {
+        const recipients = await resolveRecipients(connection, {
           actor: req.user,
           studentId: row.student_id
         });
-        if (recipientId) {
-          await insertNotification(connection, { orgId: req.user.orgId, userId: recipientId, type: 'booking', refId: req.params.id });
+        for (const userId of recipients) {
+          await insertNotification(connection, {
+            orgId: req.user.orgId,
+            userId,
+            actorId: req.user.id,
+            type: 'booking_cancelled',
+            title: 'Lesson cancelled',
+            body: null,
+            // Number(), not req.params.id: every other call site passes a
+            // numeric insertId, and this one passed the raw string from the
+            // URL. MySQL coerced it so no data was corrupted, but the
+            // inconsistency meant ref_id's JS type depended on which event
+            // produced the row.
+            refId: Number(req.params.id)
+          });
         }
 
         await connection.commit();
