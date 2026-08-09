@@ -185,6 +185,62 @@ async function deleteLibraryObject(key) {
   );
 }
 
+// An organization's brand logo. The one object in this app that is NOT
+// private-and-presigned, deliberately: the logo renders in the sidebar of
+// every page for every member, so a 10-minute signed URL would mean a signing
+// round-trip per page load and a broken image on any tab left open longer
+// than that. A logo is public branding, not tenant data.
+//
+// An organization's brand logo. Private in the bucket like everything else,
+// and handed to the browser as a presigned URL -- the same shape as library
+// previews and video playback above, for the same reason: the <img> then loads
+// straight from S3, and this API never sits in the path of image bytes.
+//
+// Two earlier approaches failed and are worth not repeating. A public-read ACL
+// was rejected outright (the bucket is BucketOwnerEnforced, so ACLs are
+// disabled), and making the bucket public would have meant relaxing Block
+// Public Access on a bucket that also holds student videos and surveys.
+// Streaming the object through Express instead tripped Helmet's
+// Cross-Origin-Resource-Policy: same-origin -- the SPA and this API are
+// different origins, so the browser fetched the image and then refused to
+// render it (ERR_BLOCKED_BY_RESPONSE.NotSameOrigin, on a 200). Presigning
+// sidesteps both, because S3 sends no CORP header at all.
+async function putOrgLogoObject(key, buffer, contentType) {
+  await client.send(
+    new PutObjectCommand({
+      Bucket: config.aws.bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType
+    })
+  );
+}
+
+// Longer than the library's 10 minutes: a logo is decoration on every page
+// rather than a file someone clicks once, so the URL wants to outlive a normal
+// working session. Not indefinite -- these are still presigned URLs, and a
+// short-lived one is the point. BrandMark falls back to the text wordmark if
+// one does lapse, so the worst case is cosmetic.
+const ORG_LOGO_URL_EXPIRES_IN_SECONDS = 6 * 60 * 60;
+
+async function getOrgLogoUrl(key) {
+  const command = new GetObjectCommand({
+    Bucket: config.aws.bucket,
+    Key: key
+  });
+
+  return getSignedUrl(client, command, { expiresIn: ORG_LOGO_URL_EXPIRES_IN_SECONDS });
+}
+
+async function deleteOrgLogoObject(key) {
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: config.aws.bucket,
+      Key: key
+    })
+  );
+}
+
 module.exports = {
   putSurveyObject,
   getSurveyDownloadUrl,
@@ -198,5 +254,8 @@ module.exports = {
   headLibraryObject,
   getLibraryDownloadUrl,
   getLibraryPreviewUrl,
-  deleteLibraryObject
+  deleteLibraryObject,
+  putOrgLogoObject,
+  getOrgLogoUrl,
+  deleteOrgLogoObject
 };
