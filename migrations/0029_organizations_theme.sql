@@ -1,0 +1,42 @@
+-- 0029_organizations_theme.sql
+-- Lets an owner pick the accent color their organization wears -- the sidebar
+-- brand gradient, the active-nav highlight, and every lime-accented control.
+--
+-- Context: 0028 gave an organization a logo and a wordmark toggle, but the
+-- accent around them stayed the one hard-coded lime from tokens.css. A studio
+-- whose brand is, say, coral got a coral logo sitting inside a lime rail. This
+-- column is the third and last piece of that branding story.
+--
+-- ENGINE NOTE: production is MariaDB 11.8, not MySQL (see migrations/README.md
+-- and 0012's header). This adds a single column, so there is only one ALTER --
+-- but the same rule applies: never merge clauses into one statement here.
+--
+-- Design notes:
+--   - theme: a slug, NOT hex. The value is interpolated into CSS custom
+--     properties on the client, so accepting arbitrary text would hand a
+--     tenant owner a stylesheet-injection surface on every member's screen.
+--     A closed set validated server-side (schemas/organization.schema.js)
+--     means the column can only ever hold a name the frontend already has a
+--     hand-authored, contrast-checked palette for. Storing hex would also
+--     freeze today's palette into every row: with slugs, refining a gradient
+--     is a CSS edit, not a data migration.
+--   - VARCHAR(32) rather than a MySQL ENUM: adding a palette to an ENUM is an
+--     ALTER on a hot table and would put the list of themes in two places
+--     (schema and validator) that must be kept in step. The validator is the
+--     single source of truth; the column just stores the chosen name.
+--   - DEFAULT 'lime' is the palette whose values are byte-identical to the
+--     current tokens.css accent, so every existing organization renders
+--     exactly as it does today and this migration is visually a no-op.
+--     NOT NULL for the same reason: there is no "no theme" state to handle in
+--     the serializer or the client -- an org always wears something.
+--
+-- Security: adds no PII -- a display preference. Same host constraint as
+-- 0001-0028: ENCRYPTION='Y' intentionally NOT specified (the Hostinger-managed
+-- host has no keyring plugin configured).
+
+ALTER TABLE organizations
+  ADD COLUMN theme VARCHAR(32) NOT NULL DEFAULT 'lime' AFTER show_name_with_logo;
+
+-- Down / rollback (not executed by run.js -- forward-only convention; kept
+-- for reference/manual use only):
+-- ALTER TABLE organizations DROP COLUMN theme;

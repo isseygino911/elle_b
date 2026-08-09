@@ -7,13 +7,14 @@ const { ROLES } = require('../constants/roles');
 const { validateBody } = require('../middleware/validate');
 const { updateOrganizationSchema } = require('../schemas/organization.schema');
 const { uploadOrgLogoFile } = require('../middleware/upload');
+const { ORGANIZATION_THEMES, DEFAULT_ORGANIZATION_THEME } = require('../constants/theme');
 const s3 = require('../services/s3');
 
 const router = express.Router();
 
 // Every query in this file selects this list rather than `*`, so adding a
 // column to `organizations` never leaks it to the client by accident.
-const ORGANIZATION_COLUMNS = 'id, name, logo_key, show_name_with_logo, created_at';
+const ORGANIZATION_COLUMNS = 'id, name, logo_key, show_name_with_logo, theme, created_at';
 
 // The wire shape of an organization. Two things happen here that matter:
 //
@@ -24,12 +25,18 @@ const ORGANIZATION_COLUMNS = 'id, name, logo_key, show_name_with_logo, created_a
 //   - show_name_with_logo becomes a real boolean. MySQL hands back 0/1 for
 //     TINYINT(1), and `0` arriving in JSON as a number would be truthy-tested
 //     correctly but compared (=== true) wrongly by any future caller.
+//   - theme falls back to the default rather than trusting the column blindly.
+//     The value is a slug the client resolves to a palette, and a row written
+//     before 0029 (or by hand) could hold something the frontend has no
+//     palette for. Normalising here means every consumer -- not just the
+//     settings page -- sees a name that is guaranteed to render.
 async function serializeOrganization(row) {
   return {
     id: row.id,
     name: row.name,
     logo_url: row.logo_key ? await s3.getOrgLogoUrl(row.logo_key) : null,
     show_name_with_logo: Boolean(row.show_name_with_logo),
+    theme: ORGANIZATION_THEMES.includes(row.theme) ? row.theme : DEFAULT_ORGANIZATION_THEME,
     created_at: row.created_at
   };
 }
@@ -70,8 +77,8 @@ router.get('/', requireAuth(), async (req, res, next) => {
   }
 });
 
-// Rename the organization, and/or set whether its name shows beside the logo.
-// Owner only.
+// Rename the organization, set whether its name shows beside the logo, and/or
+// choose the accent palette it wears. Owner only.
 //
 // Deliberately requireRole(OWNER) rather than CAN_READ_STUDENT_DETAIL, which
 // would also admit teachers: an admin renaming the whole studio is not a
@@ -116,6 +123,14 @@ router.patch(
       if (req.body.show_name_with_logo !== undefined) {
         assignments.push('show_name_with_logo = ?');
         values.push(req.body.show_name_with_logo ? 1 : 0);
+      }
+
+      // Already narrowed to a known slug by the schema's z.enum -- nothing
+      // arbitrary can reach the column, which is what makes it safe for the
+      // client to interpolate into a CSS custom property.
+      if (req.body.theme !== undefined) {
+        assignments.push('theme = ?');
+        values.push(req.body.theme);
       }
 
       values.push(req.user.orgId);
