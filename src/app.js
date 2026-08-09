@@ -21,6 +21,7 @@ const organizationRoute = require('./routes/organization.route');
 const broadcastsRoute = require('./routes/broadcasts.route');
 const coursesRoute = require('./routes/courses.route');
 const assignmentsRoute = require('./routes/assignments.route');
+const submissionsRoute = require('./routes/submissions.route');
 
 const app = express();
 
@@ -76,6 +77,13 @@ app.use('/organization', organizationRoute);
 app.use('/broadcasts', broadcastsRoute);
 app.use('/courses', coursesRoute);
 app.use('/courses/:courseId/assignments', assignmentsRoute);
+// Mounted at the root rather than under a prefix, because it serves two
+// resource families: /assignments/:id/submissions (submitting and listing
+// against an assignment) and /submissions/:id (one attempt, its files, and the
+// review). Nesting the second under the first would put a submission's id
+// behind an assignment id the client already resolved, for no gain -- the
+// scope check reads the parent chain from the row either way.
+app.use('/', submissionsRoute);
 
 // Fallback error handler — must be last, must have 4 args.
 app.use((err, req, res, _next) => {

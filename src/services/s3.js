@@ -22,6 +22,11 @@ const {
   UPLOAD_URL_EXPIRES_IN_SECONDS: LIBRARY_UPLOAD_URL_EXPIRES_IN_SECONDS,
   DOWNLOAD_URL_EXPIRES_IN_SECONDS: LIBRARY_DOWNLOAD_URL_EXPIRES_IN_SECONDS
 } = require('../constants/library');
+const {
+  MAX_FILE_SIZE_BYTES: SUBMISSION_MAX_FILE_SIZE_BYTES,
+  UPLOAD_URL_EXPIRES_IN_SECONDS: SUBMISSION_UPLOAD_URL_EXPIRES_IN_SECONDS,
+  DOWNLOAD_URL_EXPIRES_IN_SECONDS: SUBMISSION_DOWNLOAD_URL_EXPIRES_IN_SECONDS
+} = require('../constants/submissions');
 
 const DOWNLOAD_URL_EXPIRES_IN_SECONDS = 600;
 
@@ -185,6 +190,94 @@ async function deleteLibraryObject(key) {
   );
 }
 
+// --- Submissions ----------------------------------------------------------
+//
+// Four near-copies of the library functions above, deliberately. The domains
+// differ in size cap, expiry and allowed types, and each set is read alongside
+// its own constants file -- collapsing them into one parameterized helper would
+// mean a change to homework limits silently reaching the library, and would put
+// the caps behind an argument rather than in a file named for the domain.
+
+// Builds the presigned-POST params for a submission attachment or camera take.
+//
+// The ['eq', '$Content-Type', ...] pin is what makes the recording path work:
+// the browser uploads the blob relabelled to a bare 'video/webm', and this
+// condition requires the upload to carry exactly the type it was signed for.
+async function createSubmissionUploadPost(key, contentType) {
+  return createPresignedPost(client, {
+    Bucket: config.aws.bucket,
+    Key: key,
+    Conditions: [
+      ['content-length-range', 0, SUBMISSION_MAX_FILE_SIZE_BYTES],
+      ['eq', '$Content-Type', contentType]
+    ],
+    Fields: {
+      'Content-Type': contentType
+    },
+    Expires: SUBMISSION_UPLOAD_URL_EXPIRES_IN_SECONDS
+  });
+}
+
+// Confirms a submission upload landed before the row is written, and reports
+// the size/type S3 actually saw. The route uses these instead of the
+// client-declared values -- a student's browser is not a trustworthy source for
+// the numbers the caps are checked against.
+//
+// Returns null on 404 so the caller can answer "retry the upload"; any other
+// error is unexpected and propagates.
+async function headSubmissionObject(key) {
+  try {
+    const result = await client.send(
+      new HeadObjectCommand({ Bucket: config.aws.bucket, Key: key })
+    );
+    return { contentLength: result.ContentLength, contentType: result.ContentType };
+  } catch (err) {
+    if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+// Presigned GET for a submitted file.
+//
+// `disposition` decides whether the browser saves or renders it, and both are
+// needed here for the same reason the library needs both: an attachment is
+// downloaded, but a camera take must play inline in a <video> element. The two
+// need separate URLs because Content-Disposition is baked into the signature.
+//
+// Filename handling matches getLibraryObjectUrl exactly -- quoted ASCII
+// fallback plus RFC 5987 filename* -- so a student's non-ASCII filename
+// survives into the teacher's save dialog intact.
+async function getSubmissionObjectUrl(key, filename, disposition = 'attachment') {
+  const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  const command = new GetObjectCommand({
+    Bucket: config.aws.bucket,
+    Key: key,
+    ResponseContentDisposition: `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+  });
+
+  return getSignedUrl(client, command, { expiresIn: SUBMISSION_DOWNLOAD_URL_EXPIRES_IN_SECONDS });
+}
+
+async function getSubmissionDownloadUrl(key, filename) {
+  return getSubmissionObjectUrl(key, filename, 'attachment');
+}
+
+// Serves the inline player a recording needs.
+async function getSubmissionPreviewUrl(key, filename) {
+  return getSubmissionObjectUrl(key, filename, 'inline');
+}
+
+async function deleteSubmissionObject(key) {
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: config.aws.bucket,
+      Key: key
+    })
+  );
+}
+
 // An organization's brand logo. The one object in this app that is NOT
 // private-and-presigned, deliberately: the logo renders in the sidebar of
 // every page for every member, so a 10-minute signed URL would mean a signing
@@ -255,6 +348,11 @@ module.exports = {
   getLibraryDownloadUrl,
   getLibraryPreviewUrl,
   deleteLibraryObject,
+  createSubmissionUploadPost,
+  headSubmissionObject,
+  getSubmissionDownloadUrl,
+  getSubmissionPreviewUrl,
+  deleteSubmissionObject,
   putOrgLogoObject,
   getOrgLogoUrl,
   deleteOrgLogoObject

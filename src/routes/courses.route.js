@@ -5,6 +5,7 @@ const { requireAuth, requireCapability } = require('../middleware/auth');
 const { validateBody, validateParams, validateQuery } = require('../middleware/validate');
 const { scopeFor } = require('../utils/scope');
 const { assertStudentInScope } = require('../utils/students');
+const s3 = require('../services/s3');
 const {
   serializeCourse,
   loadCourseInScope,
@@ -437,18 +438,13 @@ router.delete(
 //   2. Nobody is told. The students whose work is about to be destroyed need
 //      to hear it from the app, not discover it as a missing page.
 //
-// S3 OBJECTS ARE NOT YET CLEANED UP -- KNOWN GAP, PHASE 4
-// submission_files rows cascade away with the course, but the objects they
-// point at stay in the bucket and become unreferenced. The upload path and its
-// s3.deleteSubmissionObject helper do not exist yet (Phase 4), so there is
-// nothing to call; today the cascade never has files to orphan because nothing
-// can create them. Phase 4 must collect s3_key values alongside assignmentIds
-// below and delete the objects AFTER the commit, best-effort, per the
-// library.route.js posture -- but INVERTED relative to that precedent:
-// library deletes the object first because a single failed row-delete leaves
-// one broken file, whereas here a rollback after deleting objects would leave
-// many surviving rows pointing at nothing. Orphaned objects cost storage;
-// orphaned rows lose data.
+// WHAT THE CASCADE CANNOT DO, this route does by hand. Three things:
+//   - notifications have no FK on ref_id (0007's header: one column cannot
+//     reference six tables), so rows pointing into this course survive it and
+//     are deleted explicitly below;
+//   - S3 objects live outside the database entirely, so submission_files rows
+//     cascade away while the media they name stays in the bucket;
+//   - nobody is told. The cascade is silent, and the students lose work.
 router.delete(
   '/:id',
   requireCapability(CAN_MANAGE_COURSES),
@@ -480,6 +476,29 @@ router.delete(
         [course.id, req.user.orgId]
       );
       const assignmentIds = assignmentRows.map((row) => row.id);
+
+      // Submission ids and S3 keys, gathered for two jobs the cascade cannot do
+      // itself.
+      //
+      // The ids are needed because submission_received and submission_reviewed
+      // put a SUBMISSION id in ref_id, not an assignment id -- so the cleanup
+      // below cannot find them by assignment. The keys are needed because
+      // deleting a row in this database does not delete an object in S3.
+      const [submissionRows] = assignmentIds.length
+        ? await pool.query(
+            'SELECT id FROM submissions WHERE assignment_id IN (?) AND org_id = ?',
+            [assignmentIds, req.user.orgId]
+          )
+        : [[]];
+      const submissionIds = submissionRows.map((row) => row.id);
+
+      const [fileRows] = submissionIds.length
+        ? await pool.query(
+            'SELECT s3_key FROM submission_files WHERE submission_id IN (?) AND org_id = ?',
+            [submissionIds, req.user.orgId]
+          )
+        : [[]];
+      const s3Keys = fileRows.map((row) => row.s3_key);
 
       // TWO DIFFERENT SETS, for two different jobs.
       //
@@ -571,15 +590,31 @@ router.delete(
         // meaningless without its type -- assignment id 7 and course id 7 are
         // different things.
         //
-        // course_deleted is deliberately NOT in either list: those rows were
-        // just written above and must outlive the course.
+        // THE THREE TYPES DO NOT SHARE AN ID SPACE, which is why this is three
+        // statements rather than one IN list. assignment_published carries an
+        // assignment id; submission_received and submission_reviewed carry a
+        // SUBMISSION id. Matching all three against assignmentIds would leave
+        // the submission notifications behind, and would delete any unrelated
+        // submission notification whose id happened to collide with an
+        // assignment id in this course.
+        //
+        // course_deleted is deliberately in no list: those rows were just
+        // written above and must outlive the course.
         if (assignmentIds.length) {
           await connection.query(
             `DELETE FROM notifications
-              WHERE org_id = ?
-                AND type IN ('assignment_published', 'submission_received', 'submission_reviewed')
-                AND ref_id IN (?)`,
+              WHERE org_id = ? AND type = 'assignment_published' AND ref_id IN (?)`,
             [req.user.orgId, assignmentIds]
+          );
+        }
+
+        if (submissionIds.length) {
+          await connection.query(
+            `DELETE FROM notifications
+              WHERE org_id = ?
+                AND type IN ('submission_received', 'submission_reviewed')
+                AND ref_id IN (?)`,
+            [req.user.orgId, submissionIds]
           );
         }
 
@@ -608,12 +643,33 @@ router.delete(
         connection.release();
       }
 
+      // S3 cleanup, AFTER the commit and best-effort.
+      //
+      // Inverted relative to library.route.js, which deletes the object first.
+      // There, one failed row-delete leaves one broken file. Here, a rollback
+      // after deleting objects would leave many surviving rows pointing at
+      // nothing -- every submission in the course. Orphaned objects cost
+      // storage; orphaned rows lose data, so the ordering favours the rows.
+      //
+      // Failures are logged rather than surfaced: the course IS deleted by this
+      // point, and answering 502 would tell the teacher their delete failed
+      // when it succeeded.
+      for (const key of s3Keys) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await s3.deleteSubmissionObject(key);
+        } catch (err) {
+          console.error(`S3 deleteSubmissionObject failed for ${key}:`, err);
+        }
+      }
+
       res.status(200).json({
         status: 'ok',
         deleted: {
           course_id: course.id,
           assignment_count: assignmentIds.length,
           submission_count: submissionCount,
+          file_count: s3Keys.length,
           notified_student_count: enrolledStudentIds.length
         }
       });
