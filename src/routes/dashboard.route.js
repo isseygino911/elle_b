@@ -6,6 +6,7 @@ const { requireAuth } = require('../middleware/auth');
 const { serializeTask, fetchScopedTasks } = require('./tasks.helpers');
 const { serializeBooking, fetchScopedBookings } = require('./bookings.helpers');
 const { computeAllStudentsProgress } = require('./students.helpers');
+const { serializeAssignment, fetchAssignmentsDue } = require('./assignments.helpers');
 
 const router = express.Router();
 
@@ -22,6 +23,20 @@ async function buildTasksSection(user) {
 async function buildUpcomingBookingsSection(user) {
   const rows = await fetchScopedBookings(user, { status: 'booked', upcoming: true, hoursAhead: 24 });
   return { count: rows.length, bookings: rows.map(serializeBooking) };
+}
+
+// Homework falling due, on the EXISTING dashboard payload rather than behind a
+// second fetch -- this file composes independent sections, and a due date is
+// one more section, not a new endpoint.
+//
+// Deliberately absent from buildManagerDashboard. Every other section here is
+// available to a manager in aggregate form, but an assignment names a course
+// whose roster is a list of students, and there is no count of homework that
+// tells a manager something they can act on. See CAN_MANAGE_COURSES in
+// constants/roles.js for the same argument at greater length.
+async function buildAssignmentsDueSection(user) {
+  const rows = await fetchAssignmentsDue(user);
+  return { count: rows.length, assignments: rows.map(serializeAssignment) };
 }
 
 // The teacher/owner dashboard. Takes the whole `user` (not just an id) because
@@ -61,6 +76,7 @@ async function buildTeacherDashboard(user) {
     unread_messages: { total_count: totalUnread, by_student: messageRows },
     upcoming_bookings: await buildUpcomingBookingsSection(user),
     tasks: await buildTasksSection(user),
+    assignments_due: await buildAssignmentsDueSection(user),
     student_progress: {
       total_count: studentProgress.length,
       students: studentProgress.slice(0, STUDENT_PROGRESS_WIDGET_LIMIT)
@@ -156,7 +172,8 @@ async function buildStudentDashboard(user) {
     pending_video_reviews: { count: videoRows.length, videos: videoRows },
     unread_messages: { count: unreadRows[0].unread_count },
     upcoming_bookings: await buildUpcomingBookingsSection(user),
-    tasks: await buildTasksSection(user)
+    tasks: await buildTasksSection(user),
+    assignments_due: await buildAssignmentsDueSection(user)
   };
 }
 

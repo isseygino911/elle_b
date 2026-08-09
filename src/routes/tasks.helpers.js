@@ -70,4 +70,8 @@ async function fetchScopedTasks(user, statusFilter) {
   return rows;
 }
 
-module.exports = { serializeTask, fetchScopedTasks };
+// formatDateOnly is exported for assignments.helpers.js: assignments.due_date
+// is a DATE column with the same YYYY-MM-DD contract as tasks.due_date, and a
+// second implementation would be a second chance to reintroduce the UTC-offset
+// shift this one exists to avoid.
+module.exports = { serializeTask, fetchScopedTasks, formatDateOnly };

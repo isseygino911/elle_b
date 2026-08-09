@@ -83,6 +83,35 @@ const CAN_BROADCAST_ROSTER = Object.freeze(new Set([ROLES.ADMIN]));
 // widening of it -- consistent with CAN_READ_AGGREGATES above.
 const CAN_READ_BROADCAST_OVERSIGHT = Object.freeze(new Set([ROLES.OWNER, ROLES.MANAGER]));
 
+// Roles permitted to author a course, publish assignments into it, enroll
+// students, and read submitted work. The teaching side of the homework feature.
+//
+// Two sets rather than one CAN_USE_COURSES plus a rank check, for the same
+// reason CAN_BROADCAST_ORG and CAN_BROADCAST_ROSTER are separate: the
+// difference between setting homework and doing it is not seniority. A rank
+// comparison in either direction gets it wrong -- `>= admin` hands a manager
+// the entire per-student submission surface, and `<= student` would let nobody
+// teach.
+//
+// `manager` is absent from BOTH, deliberately and permanently. A course roster
+// names students, an assignment is addressed to named students, and a
+// submission is a student's own work -- all three are per-student data, which
+// is the manager's one hard exclusion (see the header of this file). There is
+// no aggregate tier here for them to join: unlike broadcast, where a recipient
+// COUNT is a meaningful oversight signal, a count of homework says nothing a
+// manager can act on.
+const CAN_MANAGE_COURSES = Object.freeze(new Set([ROLES.OWNER, ROLES.ADMIN]));
+
+// Roles permitted to submit work against an assignment.
+//
+// Student only. An owner or teacher is deliberately absent even though they
+// outrank a student: a submission row is attributed to its student_id and
+// counts against that student's attempt limit, so a teacher "submitting" would
+// either be writing under someone else's name or creating a submission with no
+// author. Reviewing is the teacher's verb here, and it lives in
+// CAN_MANAGE_COURSES above.
+const CAN_SUBMIT_WORK = Object.freeze(new Set([ROLES.STUDENT]));
+
 // Returns 0 for an unknown role, so an unrecognized value can never satisfy
 // a minimum-rank check.
 function rankOf(role) {
@@ -98,5 +127,7 @@ module.exports = {
   CAN_BROADCAST_ORG,
   CAN_BROADCAST_ROSTER,
   CAN_READ_BROADCAST_OVERSIGHT,
+  CAN_MANAGE_COURSES,
+  CAN_SUBMIT_WORK,
   IS_TEACHER
 };
