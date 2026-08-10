@@ -10,8 +10,8 @@
 // can only ever select a palette the frontend already ships, hand-authored
 // and contrast-checked.
 //
-// It also keeps the palettes editable: refining a gradient is a CSS change in
-// elle_f/src/styles/tokens.css, not a migration over stored hex values.
+// It also keeps the palettes editable: refining a gradient is a change to
+// elle_f/src/lib/orgThemes.js, not a migration over stored hex values.
 //
 // KEEPING THIS IN STEP WITH THE FRONTEND
 //
@@ -27,7 +27,16 @@ const ORGANIZATION_THEMES = Object.freeze([
   'ocean',
   'coral',
   'amber',
-  'forest'
+  'forest',
+  // Added with the sidebar-wash change. Order matters: the frontend renders
+  // the picker in this order and a test asserts the two lists match exactly,
+  // so append here rather than inserting.
+  'rose',
+  'cyan',
+  'teal',
+  'indigo',
+  'plum',
+  'slate'
 ]);
 
 const DEFAULT_ORGANIZATION_THEME = 'lime';
