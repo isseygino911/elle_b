@@ -6,6 +6,7 @@ const { validateBody, validateParams, validateQuery } = require('../middleware/v
 const {
   createBookingSchema,
   openSlotsQuerySchema,
+  openSlotsRangeQuerySchema,
   listBookingsQuerySchema,
   bookingIdParamSchema,
   cancelBookingSchema
@@ -13,6 +14,7 @@ const {
 const {
   toMysqlDatetime,
   computeOpenSlots,
+  computeOpenSlotsRange,
   findOverlappingBooking,
   fetchScopedBookings,
   serializeBooking
@@ -63,6 +65,43 @@ router.get(
       const slots = await computeOpenSlots(pool, req.query.date, adminId);
 
       res.status(200).json({ date: req.query.date, slots });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// The multi-day form of the endpoint above, for the frontend's month and week
+// views. Declared adjacent to it and above any '/:id' route: bookingIdParamSchema
+// is /^\d+$/, so a literal path segment reaching a '/:id' handler would 400.
+//
+// requireAuth(), matching /open-slots and NOT requireCapability -- students are
+// the primary consumer, since the month view IS the booking UI.
+// resolveCalendarAdminId then does the real authorization.
+//
+// /open-slots is deliberately kept rather than replaced: the existing day view
+// calls it, and both now share one implementation, so keeping it costs nothing.
+router.get(
+  '/open-slots-range',
+  requireAuth(),
+  validateQuery(openSlotsRangeQuerySchema),
+  async (req, res, next) => {
+    try {
+      const adminId = await resolveCalendarAdminId(req, res);
+      if (!adminId) {
+        return;
+      }
+
+      // The span is capped in openSlotsRangeQuerySchema, so this is a
+      // constant-bounded three queries no matter what the client asks for.
+      const slotsByDate = await computeOpenSlotsRange(
+        pool, req.query.from, req.query.to, adminId
+      );
+
+      // Keyed by date rather than an array of {date, slots}: the month grid
+      // looks up by date, so an object makes that O(1) with no client-side
+      // index build. Every date in the range is present, empty ones included.
+      res.status(200).json({ from: req.query.from, to: req.query.to, slots_by_date: slotsByDate });
     } catch (err) {
       next(err);
     }
