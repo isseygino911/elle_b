@@ -38,15 +38,53 @@ const { scopeFor } = require('../utils/scope');
 // scores response, and -- worse -- their questions inflated the denominator in
 // computeAllStudentsProgress, so every student's completion ratio read far
 // lower than reality.
-async function getSurveyTotals(orgId) {
+//
+// `surveyId` narrows to a single survey. Optional because the two callers want
+// different things: computeStudentSurveyScores wants every survey (it renders
+// the per-survey breakdown), while a roster measured against one survey wants
+// only that one. See computeAllStudentsProgress for why that distinction
+// matters.
+async function getSurveyTotals(orgId, surveyId = null) {
+  const conditions = ['s.org_id = ?'];
+  const params = [orgId];
+
+  if (surveyId != null) {
+    conditions.push('s.id = ?');
+    params.push(surveyId);
+  }
+
   const [rows] = await pool.query(
     `SELECT sq.survey_id, s.title, s.title_zh, COUNT(*) AS total_questions,
             CAST(SUM(sq.points) AS UNSIGNED) AS total_points
      FROM survey_questions sq
      JOIN surveys s ON s.id = sq.survey_id
-     WHERE s.org_id = ?
+     WHERE ${conditions.join(' AND ')}
        AND EXISTS (SELECT 1 FROM survey_answers sa WHERE sa.question_id = sq.id)
      GROUP BY sq.survey_id, s.title, s.title_zh`,
+    params
+  );
+  return rows;
+}
+
+// The survey a roster is measured against by default: the most recently
+// uploaded one, matching GET /surveys' own ORDER BY uploaded_at DESC.
+//
+// Returns null for an org that has uploaded nothing, which callers must treat
+// as "no progress to show" rather than as 0% -- a studio with no curriculum
+// has not fallen behind on it.
+async function getDefaultSurveyId(orgId) {
+  const [rows] = await pool.query(
+    'SELECT id FROM surveys WHERE org_id = ? ORDER BY uploaded_at DESC, id DESC LIMIT 1',
+    [orgId]
+  );
+  return rows.length > 0 ? rows[0].id : null;
+}
+
+// Every survey in the org, for the dashboard's survey picker. Title only --
+// the picker needs to name them, not to score them.
+async function listSurveyOptions(orgId) {
+  const [rows] = await pool.query(
+    'SELECT id, title, title_zh FROM surveys WHERE org_id = ? ORDER BY uploaded_at DESC, id DESC',
     [orgId]
   );
   return rows;
@@ -97,8 +135,26 @@ async function computeStudentSurveyScores(studentId, orgId) {
 // the whole organization. Previously this selected EVERY student row in the
 // database with no predicate at all, which under multi-tenancy would have
 // shown one organization's progress table to another's.
-async function computeAllStudentsProgress(user) {
-  const surveyTotals = await getSurveyTotals(user.orgId);
+//
+// `surveyId` measures the roster against ONE survey instead of the whole
+// corpus. Optional, and omitting it preserves the original all-surveys
+// behaviour exactly -- GET /students/progress still calls it that way.
+//
+// Why the option exists: summing every survey into one denominator makes the
+// ratio mean "fraction of the org's entire accumulated question corpus this
+// student has answered", which is not what a progress bar is read as. A
+// student who finishes survey A but has not been given B or C reads 33%, and
+// uploading a new survey retroactively drops every existing student's number
+// -- the denominator grows for everyone while the numerators stay put. Since
+// the sort below is ascending and the dashboard slices the first few,
+// students who were simply never assigned the newer surveys crowd out the
+// ones actually falling behind.
+//
+// There is no is_active/assigned flag on surveys to filter by (migration 0012
+// dropped surveys.student_id and nothing replaced it), so which survey to
+// measure against cannot be derived -- it has to be passed in.
+async function computeAllStudentsProgress(user, { surveyId = null } = {}) {
+  const surveyTotals = await getSurveyTotals(user.orgId, surveyId);
   const totalQuestions = surveyTotals.reduce((sum, survey) => sum + survey.total_questions, 0);
   const totalPoints = surveyTotals.reduce((sum, survey) => sum + survey.total_points, 0);
 
@@ -118,15 +174,27 @@ async function computeAllStudentsProgress(user) {
   // error.
   let responsesByStudentId = new Map();
   if (studentRows.length > 0) {
+    // The numerator is filtered by surveyId alongside the denominator, never
+    // on its own. Narrowing only the total would leave answers to other
+    // surveys counting toward the selected survey's questions and report
+    // ratios above 100%.
+    const responseConditions = ['s.org_id = ?', 'r.student_id IN (?)'];
+    const responseParams = [user.orgId, studentRows.map((row) => row.id)];
+
+    if (surveyId != null) {
+      responseConditions.push('r.survey_id = ?');
+      responseParams.push(surveyId);
+    }
+
     const [responseRows] = await pool.query(
       `SELECT r.student_id, COUNT(DISTINCT r.question_id) AS completed_questions,
               CAST(SUM(r.points_earned) AS UNSIGNED) AS earned_points,
               MAX(r.submitted_at) AS last_submitted_at
        FROM survey_responses r
        JOIN surveys s ON s.id = r.survey_id
-       WHERE s.org_id = ? AND r.student_id IN (?)
+       WHERE ${responseConditions.join(' AND ')}
        GROUP BY r.student_id`,
-      [user.orgId, studentRows.map((row) => row.id)]
+      responseParams
     );
     responsesByStudentId = new Map(responseRows.map((row) => [row.student_id, row]));
   }
@@ -153,5 +221,7 @@ async function computeAllStudentsProgress(user) {
 
 module.exports = {
   computeStudentSurveyScores,
-  computeAllStudentsProgress
+  computeAllStudentsProgress,
+  getDefaultSurveyId,
+  listSurveyOptions
 };

@@ -6,6 +6,8 @@ const { studentIdParamSchema, sendMessageSchema } = require('../schemas/messages
 const { loadAuthorizedThread } = require('./messages.helpers');
 const { resolveRecipients } = require('../utils/counterparty');
 const { insertNotification } = require('./notifications.helpers');
+const { scopeFor } = require('../utils/scope');
+const { ROLES } = require('../constants/roles');
 
 // Mounted top-level at /messages (not nested under /students) — student_id
 // is the thread's own key, not a child resource of some other route.
@@ -25,6 +27,57 @@ function serializeMessage(row) {
     created_at: row.created_at
   };
 }
+
+// Unread totals for the caller, with no thread bodies.
+//
+// Exists so a live badge in the app shell does not have to fetch the entire
+// /dashboard payload for one integer -- which is what MessagesLayout did, and
+// what the shell would otherwise have to do on every poll, on every page.
+//
+// MUST stay declared before '/:studentId', or that param pattern captures the
+// literal string "unread-count" and the request fails param validation instead
+// of routing here. Same ordering constraint the notifications route documents
+// for its own '/read-all'.
+//
+// The scope fragment and the `sender_id != ?` condition are lifted verbatim
+// from buildTeacherDashboard: a message is unread only for someone who did not
+// send it, and dropping that would count a teacher's own outgoing messages as
+// their own unread mail.
+//
+// A MANAGER gets zeroes rather than an error. They have no threads at all
+// (assertStudentInScope denies them unconditionally), so the honest answer to
+// "how much unread mail do you have" is none -- and scopeFor would throw, which
+// would surface as a broken badge on every page of their shell rather than as
+// the empty state it actually is.
+router.get('/unread-count', requireAuth(), async (req, res, next) => {
+  try {
+    if (req.user.role === ROLES.MANAGER) {
+      res.status(200).json({ total_count: 0, by_student: [] });
+      return;
+    }
+
+    const scope = scopeFor(req.user, {
+      org: 'm.org_id',
+      admin: 'm.admin_id',
+      student: 'm.student_id'
+    });
+
+    const [rows] = await pool.query(
+      `SELECT m.student_id, u.name AS student_name, COUNT(*) AS unread_count
+         FROM messages m
+         JOIN users u ON u.id = m.student_id
+        WHERE m.sender_id != ? AND m.read_at IS NULL AND ${scope.sql}
+        GROUP BY m.student_id, u.name`,
+      [req.user.id, ...scope.params]
+    );
+
+    const totalCount = rows.reduce((sum, row) => sum + row.unread_count, 0);
+
+    res.status(200).json({ total_count: totalCount, by_student: rows });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // All three routes are requireAuth(), NOT requireCapability, deliberately: a
 // student is a legitimate participant in their own thread, and

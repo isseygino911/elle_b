@@ -372,7 +372,21 @@ router.post(
           userId: assignment.course_admin_id,
           actorId: req.user.id,
           type: 'submission_received',
-          title: `${req.user.name} submitted ${assignment.title}`,
+          // NOT `${req.user.name} submitted ...`: req.user is built from the
+          // JWT payload (middleware/auth.js) and carries id/orgId/role/adminId
+          // only -- there is no `name` on it, so that interpolation wrote the
+          // literal string "undefined" into every submission notification ever
+          // created.
+          //
+          // The name was never needed here anyway. actorId below is what
+          // identifies the sender, and notifications.route.js LEFT JOINs the
+          // actor's CURRENT name at read time -- deliberately, so a renamed
+          // user does not leave stale copies of their old name scattered
+          // through the notification table. Every other notification in the
+          // codebase uses a short static title for exactly this reason
+          // ("New message", "Lesson scheduled", "Task completed"); this was
+          // the one that tried to bake in an identity.
+          title: `New submission: ${assignment.title}`,
           body: attempt > 1 ? `Attempt ${attempt}` : null,
           refId: submissionId
         });

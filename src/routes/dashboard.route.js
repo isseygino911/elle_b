@@ -5,8 +5,13 @@ const { ROLES, CAN_READ_AGGREGATES } = require('../constants/roles');
 const { requireAuth } = require('../middleware/auth');
 const { serializeTask, fetchScopedTasks } = require('./tasks.helpers');
 const { serializeBooking, fetchScopedBookings } = require('./bookings.helpers');
-const { computeAllStudentsProgress } = require('./students.helpers');
+const {
+  computeAllStudentsProgress,
+  getDefaultSurveyId,
+  listSurveyOptions
+} = require('./students.helpers');
 const { serializeAssignment, fetchAssignmentsDue } = require('./assignments.helpers');
+const { serializeSubmission, fetchSubmissionsToGrade } = require('./submissions.helpers');
 
 const router = express.Router();
 
@@ -39,11 +44,27 @@ async function buildAssignmentsDueSection(user) {
   return { count: rows.length, assignments: rows.map(serializeAssignment) };
 }
 
+// Homework waiting on review. The teacher's counterpart to
+// pending_video_reviews, and TEACHER-ONLY in both directions: a manager must
+// never receive a row naming a student (see buildManagerDashboard's own note),
+// and for a student "work I handed in that hasn't been marked" is not an
+// action they can take -- it is a queue they are waiting on.
+//
+// serializeSubmission is reused rather than hand-shaping the row so the
+// dashboard and the submissions page agree on field names. It emits `files:
+// []` here because the query does not join submission_files: the dashboard row
+// shows a title, a name and a date, and fetching every attachment to render a
+// one-line link would be the N+1 fetchFilesBySubmission exists to avoid.
+async function buildSubmissionsToGradeSection(user) {
+  const rows = await fetchSubmissionsToGrade(user);
+  return { count: rows.length, submissions: rows.map((row) => serializeSubmission(row)) };
+}
+
 // The teacher/owner dashboard. Takes the whole `user` (not just an id) because
 // every section below scopes on role + orgId + id -- passing a synthesized
 // { id, role: 'elle' } would both name a role that no longer exists and drop
 // the tenancy fence.
-async function buildTeacherDashboard(user) {
+async function buildTeacherDashboard(user, { surveyId = null } = {}) {
   // Videos and messages are scoped the same way the list endpoints are: an
   // admin sees only their own students', an owner sees the whole organization.
   const videoScope = scopeFor(user, { org: 'v.org_id', admin: 'v.admin_id', student: 'v.student_id' });
@@ -68,7 +89,21 @@ async function buildTeacherDashboard(user) {
 
   const totalUnread = messageRows.reduce((sum, row) => sum + row.unread_count, 0);
 
-  const studentProgress = await computeAllStudentsProgress(user);
+  // Progress is measured against ONE survey rather than every survey summed
+  // together. `surveyId` comes from the query string when the teacher picks
+  // one, and otherwise defaults to the most recent upload.
+  //
+  // The old all-surveys sum meant uploading a new survey retroactively dropped
+  // every student's percentage, because the denominator grew for everyone
+  // while numerators stayed put -- see computeAllStudentsProgress for the full
+  // argument. `surveys` is shipped alongside so the picker can render without
+  // a second round trip, and `survey_id` tells the client which one these
+  // numbers actually describe.
+  const surveys = await listSurveyOptions(user.orgId);
+  const requestedSurveyId = surveyId != null && surveys.some((survey) => survey.id === surveyId)
+    ? surveyId
+    : await getDefaultSurveyId(user.orgId);
+  const studentProgress = await computeAllStudentsProgress(user, { surveyId: requestedSurveyId });
 
   return {
     role: user.role,
@@ -77,9 +112,12 @@ async function buildTeacherDashboard(user) {
     upcoming_bookings: await buildUpcomingBookingsSection(user),
     tasks: await buildTasksSection(user),
     assignments_due: await buildAssignmentsDueSection(user),
+    submissions_to_grade: await buildSubmissionsToGradeSection(user),
     student_progress: {
       total_count: studentProgress.length,
-      students: studentProgress.slice(0, STUDENT_PROGRESS_WIDGET_LIMIT)
+      students: studentProgress.slice(0, STUDENT_PROGRESS_WIDGET_LIMIT),
+      survey_id: requestedSurveyId,
+      surveys
     }
   };
 }
@@ -182,11 +220,18 @@ router.get('/', requireAuth(), async (req, res, next) => {
     // A manager gets the aggregate dashboard: counts only, never a student
     // name or id. Owners and admins get the teacher dashboard, scoped to what
     // each may see. Anyone else is a student.
+    // Parsed rather than passed through: an unparseable or negative value
+    // becomes null, which buildTeacherDashboard reads as "use the default
+    // survey". The id is additionally checked against the caller's own org
+    // there, so one tenant cannot request another's survey.
+    const parsedSurveyId = Number.parseInt(req.query.survey_id, 10);
+    const surveyId = Number.isInteger(parsedSurveyId) && parsedSurveyId > 0 ? parsedSurveyId : null;
+
     let dashboard;
     if (req.user.role === ROLES.MANAGER) {
       dashboard = await buildManagerDashboard(req.user);
     } else if (req.user.role === ROLES.OWNER || req.user.role === ROLES.ADMIN) {
-      dashboard = await buildTeacherDashboard(req.user);
+      dashboard = await buildTeacherDashboard(req.user, { surveyId });
     } else {
       dashboard = await buildStudentDashboard(req.user);
     }

@@ -4,6 +4,7 @@
 
 const pool = require('../db/pool');
 const { ROLES } = require('../constants/roles');
+const { scopeFor } = require('../utils/scope');
 
 function serializeSubmissionFile(row) {
   return {
@@ -32,6 +33,10 @@ function serializeSubmission(row, files = []) {
     id: row.id,
     org_id: row.org_id,
     assignment_id: row.assignment_id,
+    // Only selected by the dashboard's review-queue query, which needs it to
+    // build a /courses/:courseId/assignments/:id link; undefined elsewhere,
+    // where the caller already knows the course it is looking at.
+    course_id: row.course_id ?? undefined,
     student_id: row.student_id,
     student_name: row.student_name ?? undefined,
     assignment_title: row.assignment_title ?? undefined,
@@ -131,9 +136,54 @@ async function fetchFilesBySubmission(submissionIds, executor = pool) {
   return grouped;
 }
 
+// Homework waiting on a teacher's review, across every assignment they own.
+//
+// The counterpart to the dashboard's pending video reviews: videos had a
+// review queue on the dashboard and written/recorded homework did not, even
+// though `status` distinguishes 'submitted' from 'reviewed' precisely so this
+// question can be asked.
+//
+// Scoped through the parent COURSE, not the submission: `submissions` has no
+// admin_id of its own, exactly as `assignments` doesn't -- ownership is the
+// course's. fetchAssignmentsDue in assignments.helpers.js scopes the same way
+// for the same reason. An owner sees the whole org, an admin only their own
+// courses' work, and a manager throws before reaching a query (scope.js), so
+// this cannot become a route through which aggregate-only roles read a
+// student's name.
+//
+// Oldest first: a review queue is worked front to back, and the longest wait
+// is the one a student is actually feeling.
+//
+// Served by idx_submissions_assignment_id_status, whose own comment in
+// migration 0033 describes this exact query -- "the teacher's review queue,
+// and the status filter that finds what still needs looking at".
+async function fetchSubmissionsToGrade(user) {
+  const scope = scopeFor(user, { org: 's.org_id', admin: 'c.admin_id' });
+
+  const [rows] = await pool.query(
+    // a.course_id rides along so the dashboard row can link to
+    // /courses/:courseId/assignments/:id -- the real route takes both ids, and
+    // a submission row carries only the assignment's.
+    `SELECT s.id, s.org_id, s.assignment_id, s.student_id, s.attempt, s.status,
+            s.feedback, s.reviewed_by, s.reviewed_at, s.created_at,
+            u.name AS student_name, a.title AS assignment_title,
+            a.course_id AS course_id
+       FROM submissions s
+       JOIN assignments a ON a.id = s.assignment_id
+       JOIN courses c ON c.id = a.course_id
+       JOIN users u ON u.id = s.student_id
+      WHERE s.status = 'submitted' AND ${scope.sql}
+      ORDER BY s.created_at ASC, s.id ASC`,
+    scope.params
+  );
+
+  return rows;
+}
+
 module.exports = {
   serializeSubmission,
   serializeSubmissionFile,
   loadAssignmentInScope,
-  fetchFilesBySubmission
+  fetchFilesBySubmission,
+  fetchSubmissionsToGrade
 };

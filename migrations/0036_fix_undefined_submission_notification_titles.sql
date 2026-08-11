@@ -1,0 +1,57 @@
+-- 0036_fix_undefined_submission_notification_titles.sql
+-- Repairs `submission_received` notification titles that begin with the
+-- literal string "undefined".
+--
+-- THE BUG
+--
+-- submissions.route.js built the title as:
+--
+--     title: `${req.user.name} submitted ${assignment.title}`
+--
+-- but `req.user` is assembled from the JWT payload in middleware/auth.js and
+-- carries only { id, orgId, role, adminId } -- there is no `name` on it, and
+-- there never has been. So the template literal stringified `undefined` and
+-- every submission notification ever written begins:
+--
+--     "undefined submitted Listening reflection — Chopin Nocturne..."
+--
+-- The route fix (title: `New submission: ${assignment.title}`) only affects
+-- rows written from here on. This migration repairs the rows already stored.
+--
+-- WHY THE NAME IS NOT BACKFILLED IN
+--
+-- It would be possible to join users.name via actor_id and rebuild the
+-- original intended sentence. Deliberately not done, for the same reason
+-- notifications.route.js LEFT JOINs `actor_name` at read time instead of
+-- denormalising it: a display name can change, and a notification should not
+-- preserve a stale copy of one. The actor is already carried structurally by
+-- actor_id, and the client renders it as the row's byline -- which is why the
+-- affected rows show the correct sender's name underneath a title reading
+-- "undefined". Only the title was ever wrong.
+--
+-- This also brings the type in line with every other notification in the
+-- codebase ("New message", "Lesson scheduled", "Task completed"): a short
+-- static title, with identity supplied by the join.
+--
+-- IDEMPOTENT / NARROW
+--
+-- Matched on the exact broken prefix 'undefined submitted %' AND
+-- type = 'submission_received', so:
+--   * a legitimate title that merely contains the word "undefined" elsewhere
+--     is untouched;
+--   * re-running changes nothing, since repaired rows no longer match;
+--   * rows written after the route fix already read "New submission: ..." and
+--     are not matched.
+--
+-- SUBSTRING is used rather than a rebuild from the assignments table: the
+-- assignment title is already embedded in the stored string after the known
+-- 20-character prefix "undefined submitted ", and reading it back out cannot
+-- disagree with what the recipient was originally shown. Joining through
+-- submissions -> assignments would instead pick up the assignment's CURRENT
+-- title, silently rewriting the history of a notification whose assignment was
+-- renamed after the fact.
+
+UPDATE notifications
+   SET title = CONCAT('New submission: ', SUBSTRING(title FROM 21))
+ WHERE type = 'submission_received'
+   AND title LIKE 'undefined submitted %';
