@@ -6,7 +6,6 @@ const { requireCapability, requireRole } = require('../middleware/auth');
 const { ROLES, CAN_READ_STUDENT_DETAIL } = require('../constants/roles');
 const { validateParams, validateBody } = require('../middleware/validate');
 const { studentIdParamSchema, reassignStudentSchema } = require('../schemas/students.schema');
-const { computeStudentSurveyScores, computeAllStudentsProgress } = require('./students.helpers');
 
 const router = express.Router();
 
@@ -135,44 +134,6 @@ router.patch(
       res.status(200).json({
         student: { ...serializeStudent(student), admin_id: adminId }
       });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-// Every student's overall survey completion in one call — backs the
-// Students list panel's per-row badge. Same computeAllStudentsProgress used
-// by the dashboard's student_progress widget (dashboard.route.js), so both
-// surfaces agree on what "completion" means.
-router.get('/progress', requireCapability(CAN_READ_STUDENT_DETAIL), async (req, res, next) => {
-  try {
-    const students = await computeAllStudentsProgress(req.user);
-    res.status(200).json({ students });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.get(
-  '/:id/scores',
-  requireCapability(CAN_READ_STUDENT_DETAIL),
-  validateParams(studentIdParamSchema),
-  async (req, res, next) => {
-    try {
-      // assertStudentInScope, not a bare id lookup: an admin must not be able
-      // to read a peer's student's scores by guessing an id, and nobody may
-      // reach across organizations. A student not in scope is reported as 404,
-      // indistinguishable from "does not exist".
-      const student = await assertStudentInScope(req.user, req.params.id);
-
-      if (!student) {
-        return res.status(404).json({ status: 'error', message: 'Student not found' });
-      }
-
-      const scores = await computeStudentSurveyScores(student.id, student.org_id);
-
-      res.status(200).json({ student: serializeStudent(student), scores });
     } catch (err) {
       next(err);
     }

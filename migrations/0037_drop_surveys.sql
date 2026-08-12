@@ -1,0 +1,65 @@
+-- 0037_drop_surveys.sql
+-- Drops the survey feature's four tables and all the data in them.
+--
+-- WHY
+--
+-- The survey feature has been removed from the application entirely. In the
+-- same change, routes/surveys.route.js, schemas/surveys.schema.js,
+-- services/surveyXmlParser.js, services/surveyExport.js and
+-- routes/students.helpers.js were deleted, /surveys was unmounted from
+-- app.js, and the two survey-backed endpoints on the students router
+-- (GET /students/progress and GET /students/:id/scores) went with them.
+-- Nothing in the codebase reads these tables any more.
+--
+-- The student-progress surfaces that were computed from this data -- the
+-- dashboard's student_progress section, the Students list completion badges
+-- and the Student Detail scores table -- were removed rather than repointed
+-- at another source. Survey responses were their only input.
+--
+-- DROP ORDER
+--
+-- Child -> parent, so no DROP is refused by a foreign key still pointing at
+-- the table being dropped:
+--
+--   survey_responses  -> FKs to surveys, survey_questions, survey_answers, users
+--   survey_answers    -> FK to survey_questions (and organizations, via 0023)
+--   survey_questions  -> FK to surveys (and organizations, via 0023)
+--   surveys           -> FK to organizations (via 0023)
+--
+-- There are ZERO inbound foreign keys from non-survey tables -- verified
+-- against both the migration history and a production dump -- so nothing
+-- outside this set is affected. The outbound edges (survey_responses
+-- .student_id -> users, and the org_id columns 0023 added to the other three)
+-- are dropped along with their tables; `users` and `organizations` are
+-- untouched. No non-survey table carries a survey column, so there is nothing
+-- to ALTER anywhere else.
+--
+-- IRREVERSIBLE
+--
+-- This is a deliberate hard delete. No archive of the survey data is taken
+-- before it runs, by explicit decision -- DROP TABLE removes the tables and
+-- their rows in one step, and there is no undo. Take a backup first if that
+-- decision has changed since this was written.
+--
+-- MariaDB DDL is not transactional (see README), so a failure partway leaves
+-- some tables already gone. IF EXISTS makes each statement a no-op once its
+-- table is dropped, so re-running `npm run migrate` completes the job rather
+-- than erroring on the tables that did succeed.
+--
+-- WHAT IS DELIBERATELY LEFT BEHIND
+--
+-- Migrations 0002, 0010-0014 and the survey portion of 0023 stay on disk as
+-- applied history, per this directory's rule against editing or deleting an
+-- applied migration. Their schema_migrations rows stay too: deleting those
+-- while the files remain would make the runner treat them as unapplied and
+-- recreate every table this migration drops. On a fresh install the history
+-- replays create-then-drop and ends in the same correct state.
+--
+-- The S3 objects under the "surveys/" key prefix are NOT touched here. They
+-- are removed by scripts/purge-survey-s3.js, which is opt-in and never runs
+-- as part of a migration.
+
+DROP TABLE IF EXISTS survey_responses;
+DROP TABLE IF EXISTS survey_answers;
+DROP TABLE IF EXISTS survey_questions;
+DROP TABLE IF EXISTS surveys;

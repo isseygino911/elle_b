@@ -1,5 +1,5 @@
 // Shared filename sanitizer used when building S3 keys for uploaded files
-// (surveys and videos). Strips anything outside a safe character set and
+// (videos and library files). Strips anything outside a safe character set and
 // caps length so the resulting S3 key can't contain path separators,
 // unicode weirdness, or run unreasonably long.
 

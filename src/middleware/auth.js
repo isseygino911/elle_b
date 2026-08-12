@@ -7,9 +7,9 @@
 //
 //   requireRole(...roles)             -- exact allowlist. For endpoints that
 //                                        belong to specific roles regardless of
-//                                        seniority (e.g. submitting a survey
-//                                        answer is student-only and must NOT be
-//                                        reachable by an admin).
+//                                        seniority (e.g. submitting a homework
+//                                        submission is student-only and must NOT
+//                                        be reachable by an admin).
 //
 //   requireMinRank(role)              -- ADMINISTRATIVE actions only, where
 //                                        seniority genuinely implies capability.
@@ -25,7 +25,7 @@
 //
 // Usage:
 //   router.get('/students', requireCapability(CAN_READ_STUDENT_DETAIL), handler)
-//   router.post('/surveys/:id/answers', requireRole(ROLES.STUDENT), handler)
+//   router.post('/assignments/:id/submissions', requireRole(ROLES.STUDENT), handler)
 
 const { verifyToken } = require('../utils/jwt');
 const { rankOf } = require('../constants/roles');

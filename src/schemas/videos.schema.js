@@ -1,4 +1,4 @@
-// zod schemas for the videos/ route. Unlike surveys' multipart metadata,
+// zod schemas for the videos/ route. Unlike multipart metadata,
 // these bodies are plain JSON, so student_id/content_length are accepted as
 // either a JSON number or a numeric string and normalized to a number.
 

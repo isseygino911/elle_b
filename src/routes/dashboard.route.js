@@ -5,20 +5,10 @@ const { ROLES, CAN_READ_AGGREGATES } = require('../constants/roles');
 const { requireAuth } = require('../middleware/auth');
 const { serializeTask, fetchScopedTasks } = require('./tasks.helpers');
 const { serializeBooking, fetchScopedBookings } = require('./bookings.helpers');
-const {
-  computeAllStudentsProgress,
-  getDefaultSurveyId,
-  listSurveyOptions
-} = require('./students.helpers');
 const { serializeAssignment, fetchAssignmentsDue } = require('./assignments.helpers');
 const { serializeSubmission, fetchSubmissionsToGrade } = require('./submissions.helpers');
 
 const router = express.Router();
-
-// How many of the least-progressed students to surface in the dashboard
-// widget -- a glanceable shortlist, not the full roster (that's what the
-// /students section is for).
-const STUDENT_PROGRESS_WIDGET_LIMIT = 6;
 
 async function buildTasksSection(user) {
   const rows = await fetchScopedTasks(user, 'pending');
@@ -64,7 +54,7 @@ async function buildSubmissionsToGradeSection(user) {
 // every section below scopes on role + orgId + id -- passing a synthesized
 // { id, role: 'elle' } would both name a role that no longer exists and drop
 // the tenancy fence.
-async function buildTeacherDashboard(user, { surveyId = null } = {}) {
+async function buildTeacherDashboard(user) {
   // Videos and messages are scoped the same way the list endpoints are: an
   // admin sees only their own students', an owner sees the whole organization.
   const videoScope = scopeFor(user, { org: 'v.org_id', admin: 'v.admin_id', student: 'v.student_id' });
@@ -89,22 +79,6 @@ async function buildTeacherDashboard(user, { surveyId = null } = {}) {
 
   const totalUnread = messageRows.reduce((sum, row) => sum + row.unread_count, 0);
 
-  // Progress is measured against ONE survey rather than every survey summed
-  // together. `surveyId` comes from the query string when the teacher picks
-  // one, and otherwise defaults to the most recent upload.
-  //
-  // The old all-surveys sum meant uploading a new survey retroactively dropped
-  // every student's percentage, because the denominator grew for everyone
-  // while numerators stayed put -- see computeAllStudentsProgress for the full
-  // argument. `surveys` is shipped alongside so the picker can render without
-  // a second round trip, and `survey_id` tells the client which one these
-  // numbers actually describe.
-  const surveys = await listSurveyOptions(user.orgId);
-  const requestedSurveyId = surveyId != null && surveys.some((survey) => survey.id === surveyId)
-    ? surveyId
-    : await getDefaultSurveyId(user.orgId);
-  const studentProgress = await computeAllStudentsProgress(user, { surveyId: requestedSurveyId });
-
   return {
     role: user.role,
     pending_video_reviews: { count: videoRows.length, videos: videoRows },
@@ -112,13 +86,7 @@ async function buildTeacherDashboard(user, { surveyId = null } = {}) {
     upcoming_bookings: await buildUpcomingBookingsSection(user),
     tasks: await buildTasksSection(user),
     assignments_due: await buildAssignmentsDueSection(user),
-    submissions_to_grade: await buildSubmissionsToGradeSection(user),
-    student_progress: {
-      total_count: studentProgress.length,
-      students: studentProgress.slice(0, STUDENT_PROGRESS_WIDGET_LIMIT),
-      survey_id: requestedSurveyId,
-      surveys
-    }
+    submissions_to_grade: await buildSubmissionsToGradeSection(user)
   };
 }
 
@@ -220,18 +188,11 @@ router.get('/', requireAuth(), async (req, res, next) => {
     // A manager gets the aggregate dashboard: counts only, never a student
     // name or id. Owners and admins get the teacher dashboard, scoped to what
     // each may see. Anyone else is a student.
-    // Parsed rather than passed through: an unparseable or negative value
-    // becomes null, which buildTeacherDashboard reads as "use the default
-    // survey". The id is additionally checked against the caller's own org
-    // there, so one tenant cannot request another's survey.
-    const parsedSurveyId = Number.parseInt(req.query.survey_id, 10);
-    const surveyId = Number.isInteger(parsedSurveyId) && parsedSurveyId > 0 ? parsedSurveyId : null;
-
     let dashboard;
     if (req.user.role === ROLES.MANAGER) {
       dashboard = await buildManagerDashboard(req.user);
     } else if (req.user.role === ROLES.OWNER || req.user.role === ROLES.ADMIN) {
-      dashboard = await buildTeacherDashboard(req.user, { surveyId });
+      dashboard = await buildTeacherDashboard(req.user);
     } else {
       dashboard = await buildStudentDashboard(req.user);
     }

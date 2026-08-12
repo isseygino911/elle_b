@@ -4,7 +4,7 @@
 // THE HIERARCHY
 //   owner   (rank 4) -- one per organization. Sees everything in their org.
 //   manager (rank 3) -- AGGREGATES ONLY. Per-admin rollups. Must NEVER read
-//                       an individual student's surveys, videos or messages.
+//                       an individual student's videos or messages.
 //   admin   (rank 2) -- a teacher. Sees only their own students. This is the
 //                       old 'elle' role, renamed by migration 0017.
 //   student (rank 1) -- sees only themselves.
@@ -41,7 +41,7 @@ const RANK = Object.freeze({
   [ROLES.STUDENT]: 1
 });
 
-// Roles permitted to read an INDIVIDUAL student's records -- surveys, videos,
+// Roles permitted to read an INDIVIDUAL student's records -- videos,
 // message threads, comments, booking detail, the student roster.
 //
 // Positive allowlist: any role not named here is DENIED. A role added to this

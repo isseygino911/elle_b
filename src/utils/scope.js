@@ -7,7 +7,7 @@
 //     // ...else: no condition at all, i.e. see every row in the table
 //
 // That shape appeared in tasks.helpers.js, bookings.helpers.js,
-// videos.route.js and surveys.route.js, plus a SQL-level variant in
+// videos.route.js, plus a SQL-level variant in
 // bookings.route.js ("AND (? = 'elle' OR student_id = ?)"). It was correct
 // when the only two roles were 'elle' and 'student'. It is actively dangerous
 // the moment a third role exists: ADDING a role silently grants it access to
@@ -64,8 +64,8 @@ function scopeFor(user, columns) {
     // Admin (teacher): only rows belonging to them.
     //
     // The org-only fallback is for tables that genuinely have no admin column
-    // -- surveys, for instance, which migration 0012 made org-level curriculum
-    // visible to every student. It is NOT a general escape hatch: a table that
+    // -- org-level content visible to every student in the organization. It is
+    // NOT a general escape hatch: a table that
     // has an admin column must always pass it, or an admin would see peers'
     // rows.
     case ROLES.ADMIN:

@@ -172,7 +172,7 @@ router.post(
         return res.status(404).json({ status: 'error', message: 'Organization not found' });
       }
 
-      // Mirrors the surveys convention (a UUID per object), but prefixed with
+      // Mirrors the videos convention (a UUID per object), but prefixed with
       // the org id so every object in the bucket is attributable to a tenant
       // at a glance. The UUID -- not the original filename -- is what makes
       // the key unguessable and lets the object be cached immutably.

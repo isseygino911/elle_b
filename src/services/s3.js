@@ -1,5 +1,5 @@
 // The one place @aws-sdk/client-s3 is imported. Everything else in this app
-// that needs to store/retrieve a survey or video file goes through the
+// that needs to store/retrieve a video, library or logo file goes through the
 // functions exported below.
 
 const {
@@ -28,40 +28,9 @@ const {
   DOWNLOAD_URL_EXPIRES_IN_SECONDS: SUBMISSION_DOWNLOAD_URL_EXPIRES_IN_SECONDS
 } = require('../constants/submissions');
 
-const DOWNLOAD_URL_EXPIRES_IN_SECONDS = 600;
-
 // Credentials come from the default provider chain (env vars in this app's
 // deployment) — never read directly from process.env here.
 const client = new S3Client({ region: config.aws.region });
-
-async function putSurveyObject(key, buffer, contentType) {
-  await client.send(
-    new PutObjectCommand({
-      Bucket: config.aws.bucket,
-      Key: key,
-      Body: buffer,
-      ContentType: contentType
-    })
-  );
-}
-
-async function getSurveyDownloadUrl(key) {
-  const command = new GetObjectCommand({
-    Bucket: config.aws.bucket,
-    Key: key
-  });
-
-  return getSignedUrl(client, command, { expiresIn: DOWNLOAD_URL_EXPIRES_IN_SECONDS });
-}
-
-async function deleteSurveyObject(key) {
-  await client.send(
-    new DeleteObjectCommand({
-      Bucket: config.aws.bucket,
-      Key: key
-    })
-  );
-}
 
 // Builds the presigned-POST params (url + fields) the client uses to upload
 // a class/practice video file directly to S3. Enforces the file-size cap
@@ -292,7 +261,7 @@ async function deleteSubmissionObject(key) {
 // Two earlier approaches failed and are worth not repeating. A public-read ACL
 // was rejected outright (the bucket is BucketOwnerEnforced, so ACLs are
 // disabled), and making the bucket public would have meant relaxing Block
-// Public Access on a bucket that also holds student videos and surveys.
+// Public Access on a bucket that also holds student videos and library files.
 // Streaming the object through Express instead tripped Helmet's
 // Cross-Origin-Resource-Policy: same-origin -- the SPA and this API are
 // different origins, so the browser fetched the image and then refused to
@@ -335,10 +304,6 @@ async function deleteOrgLogoObject(key) {
 }
 
 module.exports = {
-  putSurveyObject,
-  getSurveyDownloadUrl,
-  DOWNLOAD_URL_EXPIRES_IN_SECONDS,
-  deleteSurveyObject,
   createVideoUploadPost,
   headVideoObject,
   getVideoPlaybackUrl,
