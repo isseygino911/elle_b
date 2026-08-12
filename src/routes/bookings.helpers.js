@@ -376,7 +376,7 @@ async function findOverlappingBooking(connection, { adminId, startIsoUtc, durati
   return rows[0] || null;
 }
 
-async function fetchScopedBookings(user, { status, upcoming, hoursAhead } = {}) {
+async function fetchScopedBookings(user, { status, upcoming, hoursAhead, studentId } = {}) {
   // Column names are qualified with the `b` alias used by the query below.
   // An admin sees only bookings on their own calendar; an owner sees every
   // booking in their organization; a student sees only their own. A manager
@@ -398,6 +398,16 @@ async function fetchScopedBookings(user, { status, upcoming, hoursAhead } = {}) 
   if (status) {
     conditions.push('b.status = ?');
     params.push(status);
+  }
+
+  // Narrows to one student, for GET /students/:id/detail. ADDITIVE to the
+  // tenancy predicate above, never a replacement for it: an admin passing
+  // another teacher's student id still matches nothing, because scope.sql
+  // already pins b.admin_id to them. The caller's right to see this student is
+  // established separately by assertStudentInScope.
+  if (studentId) {
+    conditions.push('b.student_id = ?');
+    params.push(studentId);
   }
 
   if (upcoming) {
