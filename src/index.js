@@ -1,6 +1,11 @@
 const path = require('path');
 
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+// Defaults to .env -- which points at production, so `npm run dev` and
+// `npm start` keep the behaviour they have always had. ENV_FILE opts a single
+// process into a different one: `npm run local` pins it at .env.dev, the local
+// Docker container on 3307. Same reasoning as seed-dev.js's DEV_ENV_FILE, which
+// refuses to fall back to .env for exactly this reason.
+require('dotenv').config({ path: path.join(__dirname, '..', process.env.ENV_FILE || '.env') });
 
 const app = require('./app');
 const config = require('./config/env');

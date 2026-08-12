@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "local": "npm run db:up && ENV_FILE=.env.dev nodemon src/index.js",
+    "seed:dev": "DEV_ENV_FILE=./.env.dev node scripts/seed-dev.js",
     "migrate": "node migrations/run.js",
     "seed:elle": "node scripts/seed-elle.js",
     "seed:owner": "node scripts/seed-owner.js",

@@ -73,7 +73,40 @@ const ORG_NAME = 'Elle Dev Music School';
 
 // The account asked for. Kept as a constant because it is the one thing a
 // human running this actually needs to remember.
-const ADMIN_EMAIL = 'admin@admin.com';
+//
+// Overridable so this seeder can dress ANY teacher's dashboard, not just the
+// one it was written for -- the .env.dev accounts from seed-dev.js are the
+// other set a human logs in as, and they were reaching an empty dashboard
+// because every row below hung off admin@admin.com instead. The data shapes
+// (ages, buckets, windows) are what makes this file worth reusing; only whose
+// they are needed to vary.
+const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL || 'admin@admin.com';
+const ADMIN_NAME = process.env.SEED_ADMIN_NAME || 'Admin Teacher';
+
+// Same override for the roster. Passed as "Name:email" pairs so an existing
+// student keeps its name on upsert (email is the natural key) rather than
+// being renamed by a positional default.
+const STUDENT_ROSTER = process.env.SEED_STUDENTS
+  ? process.env.SEED_STUDENTS.split(',').map((pair) => {
+      const [name, email] = pair.split(':');
+      return [name.trim(), email.trim()];
+    })
+  : [
+      ['Ava Reynolds', 'ava@admin.test'],
+      ['Noah Fletcher', 'noah@admin.test'],
+      ['Mia Sandoval', 'mia@admin.test'],
+      ['Leo Nakamura', 'leo@admin.test'],
+      ['Zoe Halloway', 'zoe@admin.test'],
+      ['Ethan Brandt', 'ethan@admin.test'],
+    ];
+
+// The data plans below were written against a six-student roster and index it
+// positionally. A shorter roster (SEED_STUDENTS) would run off the end, so the
+// index wraps -- every planned row still gets created, just distributed across
+// however many students there are. Wrapping rather than skipping matters
+// because the plans are balanced by AGE and bucket, not by student: dropping
+// rows would empty the very dashboard buckets this seeder exists to fill.
+const pick = (list, i) => list[i % list.length];
 
 const daysAgo = (n) => new Date(Date.now() - n * 86400000);
 const hoursFromNow = (n) => new Date(Date.now() + n * 3600000);
@@ -133,20 +166,13 @@ async function main() {
   console.log('Users:');
   // 'admin' is the teacher role in this schema; it is the role whose dashboard
   // has the most surface, which is what makes it the useful one to log in as.
-  const adminId = await upsertUser({ role: 'admin', name: 'Admin Teacher', email: ADMIN_EMAIL });
+  const adminId = await upsertUser({ role: 'admin', name: ADMIN_NAME, email: ADMIN_EMAIL });
 
   // Students belong to this teacher via admin_id -- that column is what every
   // scoped dashboard query filters on, so students attached to a different
   // teacher would leave the dashboard empty no matter how much data exists.
   const students = [];
-  for (const [name, email] of [
-    ['Ava Reynolds', 'ava@admin.test'],
-    ['Noah Fletcher', 'noah@admin.test'],
-    ['Mia Sandoval', 'mia@admin.test'],
-    ['Leo Nakamura', 'leo@admin.test'],
-    ['Zoe Halloway', 'zoe@admin.test'],
-    ['Ethan Brandt', 'ethan@admin.test'],
-  ]) {
+  for (const [name, email] of STUDENT_ROSTER) {
     students.push({ id: await upsertUser({ role: 'student', name, email, adminId }), name });
   }
 
@@ -164,7 +190,7 @@ async function main() {
     { student: 5, title: 'Recital piece, full run-through', age: 11 },
   ];
   for (const v of videoPlan) {
-    const student = students[v.student];
+    const student = pick(students, v.student);
     // s3_key is UNIQUE, so it doubles as the idempotency key: a deterministic
     // key means re-running updates in place instead of duplicating the row.
     const s3Key = `dev-seed/${student.id}/${crypto.createHash('sha1').update(v.title).digest('hex').slice(0, 12)}.mp4`;
@@ -198,7 +224,7 @@ async function main() {
     { student: 5, body: 'Ready for the recital piece feedback whenever you have time.', age: 4 },
   ];
   for (const m of messagePlan) {
-    const student = students[m.student];
+    const student = pick(students, m.student);
     const [[found]] = await db.query(
       'SELECT id FROM messages WHERE student_id=? AND body=?',
       [student.id, m.body]
@@ -228,7 +254,7 @@ async function main() {
     { student: 1, inHours: 70 },
   ];
   for (const b of bookingPlan) {
-    const student = students[b.student];
+    const student = pick(students, b.student);
     const when = hoursFromNow(b.inHours);
     const [[found]] = await db.query(
       "SELECT id FROM bookings WHERE student_id=? AND status='booked' AND ABS(TIMESTAMPDIFF(MINUTE, scheduled_at, ?)) < 90",
@@ -458,7 +484,7 @@ async function main() {
     { student: 5, type: 'video_uploaded', title: 'New practice video', body: 'Recital piece, full run-through', age: 11 },
   ];
   for (const n of notifPlan) {
-    const student = students[n.student];
+    const student = pick(students, n.student);
     const [[found]] = await db.query(
       'SELECT id FROM notifications WHERE user_id=? AND actor_id=? AND type=? AND body=?',
       [adminId, student.id, n.type, n.body]
