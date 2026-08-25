@@ -6,7 +6,10 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "port:free": "pkill -f 'nodemon src/index.js' 2>/dev/null; lsof -ti tcp:4001 -sTCP:LISTEN | xargs -r kill -9 2>/dev/null; sleep 1; true",
+    "predev": "npm run port:free",
     "dev": "nodemon src/index.js",
+    "prelocal": "npm run port:free",
     "local": "npm run db:up && ENV_FILE=.env.dev nodemon src/index.js",
     "seed:dev": "DEV_ENV_FILE=./.env.dev node scripts/seed-dev.js",
     "migrate": "node migrations/run.js",

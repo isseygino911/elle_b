@@ -12,12 +12,17 @@
  *
  * Usage (from server/): npm run migrate
  * (wired by backend-engineer to `node migrations/run.js` in server/package.json)
+ *
+ * Target DB: .env by default, which is PRODUCTION. Override with ENV_FILE to
+ * point somewhere else, matching the `npm run local` script's convention:
+ *   ENV_FILE=.env.dev npm run migrate
+ * Always apply to dev first -- a migration that fails should fail there.
  */
 
 const path = require('path');
 const fs = require('fs');
 
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('dotenv').config({ path: path.join(__dirname, '..', process.env.ENV_FILE || '.env') });
 
 const mysql = require('mysql2/promise');
 

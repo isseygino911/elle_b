@@ -1,13 +1,17 @@
+const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const pool = require('../db/pool');
 const { ROLES, CAN_MANAGE_COURSES } = require('../constants/roles');
 const { requireAuth, requireCapability } = require('../middleware/auth');
+const { uploadCourseThumbnailFile } = require('../middleware/upload');
 const { validateBody, validateParams, validateQuery } = require('../middleware/validate');
 const { scopeFor } = require('../utils/scope');
 const { assertStudentInScope } = require('../utils/students');
 const s3 = require('../services/s3');
 const {
   serializeCourse,
+  serializeCourseWithThumbnail,
   loadCourseInScope,
   fetchEnrolledStudentIds
 } = require('./courses.helpers');
@@ -133,7 +137,21 @@ router.get(
       const [rows] = await pool.query(
         `SELECT c.*, u.name AS teacher_name,
                 (SELECT COUNT(*) FROM course_enrollments e WHERE e.course_id = c.id)
-                  AS student_count
+                  AS student_count,
+                -- The same count GET /courses/:id computes for its progress
+                -- denominator, carried on the list row too: the courses list
+                -- and the dashboard's active-courses section both show it, and
+                -- without it here they would have to fetch every course
+                -- individually to render one number.
+                --
+                -- PUBLISHED only, matching the detail handler exactly -- a
+                -- draft has not been fanned out to anyone, so counting it
+                -- would overstate what a course has actually set.
+                (SELECT COUNT(*) FROM assignments a
+                  WHERE a.course_id = c.id
+                    AND a.org_id = c.org_id
+                    AND a.status = 'published')
+                  AS published_assignment_count
            FROM courses c
            JOIN users u ON u.id = c.admin_id
           WHERE ${conditions.join(' AND ')}
@@ -141,7 +159,12 @@ router.get(
         params
       );
 
-      res.status(200).json({ courses: rows.map(serializeCourse) });
+      // Signed in parallel rather than in sequence: each getSignedUrl is a
+      // local HMAC, not a network call, but the list can be long and there is
+      // no reason to serialize them.
+      res.status(200).json({
+        courses: await Promise.all(rows.map((row) => serializeCourseWithThumbnail(row)))
+      });
     } catch (err) {
       next(err);
     }
@@ -171,20 +194,55 @@ router.get(
       // one-to-one studios make a classmate list meaningless as well as
       // leaky.
       let students = [];
+      let publishedAssignmentCount = 0;
       if (CAN_MANAGE_COURSES.has(req.user.role)) {
+        // Each student's progress rides on the roster row so the detail pane
+        // can show it without a second request per student.
+        //
+        // COUNT(DISTINCT s.assignment_id), not COUNT(*): submissions keeps
+        // every attempt as its own row (0033), so a plain count would report a
+        // student who resubmitted three times as having done three
+        // assignments.
+        //
+        // The denominator is PUBLISHED assignments only. A draft has not been
+        // fanned out to anyone, so counting it would show every student as
+        // behind on work they were never given.
         const [rows] = await pool.query(
-          `SELECT u.id, u.name, u.email, e.created_at AS enrolled_at
+          `SELECT u.id, u.name, u.email, e.created_at AS enrolled_at,
+                  (SELECT COUNT(DISTINCT s.assignment_id)
+                     FROM submissions s
+                     JOIN assignments a ON a.id = s.assignment_id
+                    WHERE a.course_id = e.course_id
+                      AND a.status = 'published'
+                      AND s.student_id = u.id
+                      AND s.org_id = ?) AS submitted_count
              FROM course_enrollments e
              JOIN users u ON u.id = e.student_id
-            WHERE e.course_id = ?
+            WHERE e.course_id = ? AND e.org_id = ?
             ORDER BY u.name ASC, u.id ASC`,
-          [course.id]
+          [req.user.orgId, course.id, req.user.orgId]
         );
-        students = rows;
+        // Number() for the same reason serializeCourse casts its counts: the
+        // driver hands back COUNT() as a string.
+        students = rows.map((row) => ({ ...row, submitted_count: Number(row.submitted_count) }));
+
+        // One query rather than a per-row subquery -- the total is a property
+        // of the course, not of any one student, so it rides on the course the
+        // way student_count already does.
+        const [[totals]] = await pool.query(
+          `SELECT COUNT(*) AS total FROM assignments
+            WHERE course_id = ? AND org_id = ? AND status = 'published'`,
+          [course.id, req.user.orgId]
+        );
+        publishedAssignmentCount = totals.total;
       }
 
       res.status(200).json({
-        course: serializeCourse({ ...course, student_count: students.length }),
+        course: await serializeCourseWithThumbnail({
+          ...course,
+          student_count: students.length,
+          published_assignment_count: publishedAssignmentCount
+        }),
         students
       });
     } catch (err) {
@@ -673,6 +731,114 @@ router.delete(
           notified_student_count: enrolledStudentIds.length
         }
       });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// POST /courses/:id/thumbnail -- upload (or replace) a course's cover image.
+//
+// Guarded by CAN_MANAGE_COURSES plus loadCourseInScope rather than
+// requireRole(OWNER) as the org logo is: a logo is org-wide branding only an
+// owner may change, whereas a course belongs to the teacher who owns it. The
+// scope load is what stops a teacher writing to another teacher's course, and
+// it 404s rather than 403s for the usual reason -- a distinguishable error
+// lets a caller enumerate other tenants' ids.
+//
+// requireCapability runs before the multer middleware so an unauthorized
+// upload is refused before we spend memory buffering the file. The scope check
+// cannot run that early (it needs a DB round-trip), so a teacher posting to a
+// course they cannot reach does buffer the bytes before being turned away --
+// still bounded by the 5MB cap, and the object is never written to S3.
+router.post(
+  '/:id/thumbnail',
+  requireCapability(CAN_MANAGE_COURSES),
+  validateParams(courseIdParamSchema),
+  uploadCourseThumbnailFile('file'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ status: 'error', message: 'No file uploaded' });
+      }
+
+      const course = await loadCourseInScope(req.user, req.params.id);
+
+      if (!course) {
+        return res.status(404).json({ status: 'error', message: 'Course not found' });
+      }
+
+      // Mirrors the org-logo convention: a UUID per object, prefixed with the
+      // org id so every object in the bucket is attributable to a tenant at a
+      // glance. The UUID -- not the original filename -- is what makes the key
+      // unguessable and lets the object be cached immutably.
+      const extension = path.extname(req.file.originalname).toLowerCase();
+      const key = `course-thumbnails/${req.user.orgId}/${crypto.randomUUID()}${extension}`;
+
+      try {
+        await s3.putCourseThumbnailObject(key, req.file.buffer, req.file.mimetype);
+      } catch (err) {
+        console.error('S3 putCourseThumbnailObject failed:', err);
+        return res.status(502).json({ status: 'error', message: 'Failed to store image' });
+      }
+
+      await pool.query('UPDATE courses SET thumbnail_key = ? WHERE id = ? AND org_id = ?', [
+        key,
+        course.id,
+        req.user.orgId
+      ]);
+
+      // Best effort, and deliberately after the row is updated: the new image
+      // is already live and correct at this point. A bucket hiccup while
+      // tidying up the superseded object leaves an orphan, which is a
+      // housekeeping problem -- not a reason to fail an upload that worked.
+      if (course.thumbnail_key) {
+        try {
+          await s3.deleteCourseThumbnailObject(course.thumbnail_key);
+        } catch (err) {
+          console.error('S3 deleteCourseThumbnailObject (previous image) failed:', err);
+        }
+      }
+
+      const updated = await loadCourseInScope(req.user, course.id);
+
+      res.status(200).json({ course: await serializeCourseWithThumbnail(updated) });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// DELETE /courses/:id/thumbnail -- drop the cover image and fall back to the
+// status icon in the list panel.
+router.delete(
+  '/:id/thumbnail',
+  requireCapability(CAN_MANAGE_COURSES),
+  validateParams(courseIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const course = await loadCourseInScope(req.user, req.params.id);
+
+      if (!course) {
+        return res.status(404).json({ status: 'error', message: 'Course not found' });
+      }
+
+      await pool.query('UPDATE courses SET thumbnail_key = NULL WHERE id = ? AND org_id = ?', [
+        course.id,
+        req.user.orgId
+      ]);
+
+      if (course.thumbnail_key) {
+        try {
+          await s3.deleteCourseThumbnailObject(course.thumbnail_key);
+        } catch (err) {
+          console.error('S3 deleteCourseThumbnailObject failed:', err);
+        }
+      }
+
+      const updated = await loadCourseInScope(req.user, course.id);
+
+      res.status(200).json({ course: await serializeCourseWithThumbnail(updated) });
     } catch (err) {
       next(err);
     }

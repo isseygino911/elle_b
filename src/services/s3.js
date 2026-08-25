@@ -303,6 +303,48 @@ async function deleteOrgLogoObject(key) {
   );
 }
 
+// A course's cover image. Same shape as the org logo directly above -- private
+// in the bucket, handed over as a presigned URL -- and for the same reasons
+// documented there (BucketOwnerEnforced rules out a public-read ACL, and
+// streaming through Express trips Helmet's Cross-Origin-Resource-Policy).
+//
+// Read that block before changing anything here; both failure modes it
+// records apply verbatim to this object type.
+async function putCourseThumbnailObject(key, buffer, contentType) {
+  await client.send(
+    new PutObjectCommand({
+      Bucket: config.aws.bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType
+    })
+  );
+}
+
+// Matches the org logo's 6 hours rather than the library's 10 minutes: a
+// thumbnail is decoration on a list the user keeps open while working through
+// it, not a file they click once. RecordCard falls back to the status icon if
+// a URL does lapse, so the worst case is cosmetic.
+const COURSE_THUMBNAIL_URL_EXPIRES_IN_SECONDS = 6 * 60 * 60;
+
+async function getCourseThumbnailUrl(key) {
+  const command = new GetObjectCommand({
+    Bucket: config.aws.bucket,
+    Key: key
+  });
+
+  return getSignedUrl(client, command, { expiresIn: COURSE_THUMBNAIL_URL_EXPIRES_IN_SECONDS });
+}
+
+async function deleteCourseThumbnailObject(key) {
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket: config.aws.bucket,
+      Key: key
+    })
+  );
+}
+
 module.exports = {
   createVideoUploadPost,
   headVideoObject,
@@ -320,5 +362,8 @@ module.exports = {
   deleteSubmissionObject,
   putOrgLogoObject,
   getOrgLogoUrl,
-  deleteOrgLogoObject
+  deleteOrgLogoObject,
+  putCourseThumbnailObject,
+  getCourseThumbnailUrl,
+  deleteCourseThumbnailObject
 };

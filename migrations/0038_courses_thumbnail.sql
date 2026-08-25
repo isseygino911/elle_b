@@ -1,0 +1,42 @@
+-- 0038_courses_thumbnail.sql
+-- Gives a course a cover image, rendered in the courses list panel in place of
+-- the lucide book/archive glyph every course has shown until now.
+--
+-- Context: the course list row carried an icon chosen from the course's status
+-- (BookOpen when active, Archive when archived), which is the same glyph for
+-- every course in the list -- it distinguishes state, never identity. A
+-- teacher scanning eight courses had only the title to go on.
+--
+-- ENGINE NOTE: production is MariaDB 11.8, not MySQL (see migrations/README.md
+-- and 0012's header). This migration is a single ALTER, but if a second column
+-- is ever added here it must be issued as its own statement -- 0012 documents
+-- a reproducible errno 121 on batched multi-clause ALTER TABLE against this
+-- schema. Do not merge them.
+--
+-- Design notes:
+--   - thumbnail_key: the S3 object key, NOT the URL, exactly as
+--     organizations.logo_key does (0028). The URL is derived from
+--     key + bucket + region at read time (services/s3.js
+--     getCourseThumbnailUrl), so moving bucket or region stays a config
+--     change rather than a data migration.
+--   - The object is PRIVATE and read through a presigned URL, like the org
+--     logo. The bucket is BucketOwnerEnforced, so a public-read ACL is not
+--     available -- see the (accurate, second) comment block in services/s3.js.
+--   - NULL means "no thumbnail" -- the list row then falls back to the status
+--     icon, which is exactly today's appearance. That is what makes this
+--     migration visually inert until a teacher actually uploads something.
+--     VARCHAR(512) because the key is org-scoped and carries a UUID plus the
+--     original extension: course-thumbnails/<orgId>/<uuid>.<ext>.
+--
+-- Security: adds no PII -- an object key. Tenancy is enforced at the route
+-- layer via loadCourseInScope, as it is for every other course read/write;
+-- the org id in the key prefix is for attribution at a glance, not a boundary.
+-- Same host constraint as 0001-0037: ENCRYPTION='Y' intentionally NOT
+-- specified (the Hostinger-managed host has no keyring plugin configured).
+
+ALTER TABLE courses
+  ADD COLUMN thumbnail_key VARCHAR(512) NULL AFTER description;
+
+-- Down / rollback (not executed by run.js -- forward-only convention; kept
+-- for reference/manual use only):
+-- ALTER TABLE courses DROP COLUMN thumbnail_key;
