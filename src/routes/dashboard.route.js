@@ -10,9 +10,17 @@ const { serializeSubmission, fetchSubmissionsToGrade } = require('./submissions.
 
 const router = express.Router();
 
+// No status filter: completed tasks stay on the payload so a task a student
+// ticks off does not vanish from their teacher's dashboard the moment it is
+// done. The list renders them with a check instead of a Mark done button.
+// `count` stays the PENDING count -- the card's badge answers "how much is
+// outstanding", which a total including finished work would not.
 async function buildTasksSection(user) {
-  const rows = await fetchScopedTasks(user, 'pending');
-  return { count: rows.length, tasks: rows.map(serializeTask) };
+  const rows = await fetchScopedTasks(user);
+  return {
+    count: rows.filter((row) => row.status === 'pending').length,
+    tasks: rows.map(serializeTask)
+  };
 }
 
 async function buildUpcomingBookingsSection(user) {
