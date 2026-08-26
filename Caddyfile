@@ -3,9 +3,10 @@
 # =============================================================================
 # Lives in the server (API) repo since it's VPS/ops config, but it fronts
 # both apps, which now live in two independently-cloned repos on the VPS:
-#   - elle.isseylab.com  -> static SPA build from the client repo
+#   - arco.elleeliason.com  -> static SPA build from the client repo
 #     (https://github.com/isseygino911/elle_f.git), served directly by Caddy
-#   - api.isseylab.com   -> reverse proxy to this repo's Express API
+#   - www.arco.elleeliason.com -> permanent redirect to the apex host above
+#   - arco-api.elleeliason.com   -> reverse proxy to this repo's Express API
 #     (Docker-composed or PM2-managed, see DEPLOY.md)
 #
 # Automatic HTTPS: Caddy obtains/renews TLS certs automatically for both
@@ -18,11 +19,11 @@
 # keep it in sync with the Express server's PORT.
 # =============================================================================
 
-api.isseylab.com {
+arco-api.elleeliason.com {
 	reverse_proxy localhost:{$PORT}
 }
 
-elle.isseylab.com {
+arco.elleeliason.com {
 	# Replace with the absolute path to `dist/` inside wherever the client
 	# repo is cloned on this VPS (e.g. /var/www/elle_f/dist) — it is NOT a
 	# sibling directory of this repo anymore now that client/server are
@@ -30,4 +31,12 @@ elle.isseylab.com {
 	root * /path/to/elle_f/dist
 	file_server
 	try_files {path} /index.html
+}
+
+# The www host redirects to the apex rather than serving a second copy of the
+# SPA, so there is one canonical origin for users, links and cookies. The API
+# still allows the www origin in CORS_ORIGIN, which covers a request made from
+# a page loaded at www before the redirect takes effect.
+www.arco.elleeliason.com {
+	redir https://arco.elleeliason.com{uri} permanent
 }

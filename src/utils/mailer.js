@@ -58,7 +58,7 @@ function getTransport() {
 // already the configured address of the frontend — a second "where does the
 // app live" variable would only invite the two drifting apart.
 function buildResetLink(token) {
-  const base = (config.corsOrigin || '').split(',')[0].trim().replace(/\/$/, '');
+  const base = config.appOrigin;
   return `${base}/reset-password?token=${encodeURIComponent(token)}`;
 }
 

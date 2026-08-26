@@ -12,8 +12,9 @@ build/serve steps. This repo's `Caddyfile` fronts both, since Caddy is
 shared VPS-level config.
 
 Domains (real, assigned):
-- Frontend: `elle.isseylab.com` (static SPA build from the client repo, served by Caddy)
-- API: `api.isseylab.com` (reverse-proxied by Caddy to this Express server)
+- Frontend: `arco.elleeliason.com` (static SPA build from the client repo, served by Caddy)
+- Frontend (www): `www.arco.elleeliason.com` redirects to the apex host above
+- API: `arco-api.elleeliason.com` (reverse-proxied by Caddy to this Express server)
 
 They're split onto separate subdomains rather than one domain with an
 `/api/*` path prefix — see `Caddyfile` for the two site blocks. The client's
@@ -69,7 +70,10 @@ fallback but is no longer the primary path.
 1. Pull this repo to the VPS: `git pull origin main`.
 2. Ensure `.env` on the VPS has real production values for every var listed
    in `.env.example` (real secrets — never copied from this repo), in
-   particular `CORS_ORIGIN=https://elle.isseylab.com`, `NODE_ENV=production`
+   particular
+   `CORS_ORIGIN=https://arco.elleeliason.com,https://www.arco.elleeliason.com`
+   (comma-separated allowlist; the first entry is the canonical origin used
+   to build reset/invite links), `NODE_ENV=production`
    (makes the refresh-token cookie `Secure`, required over HTTPS), and
    `DB_HOST=localhost` (the container uses host networking — see the
    comment header in `docker-compose.prod.yml` — so `localhost` correctly
@@ -84,7 +88,7 @@ fallback but is no longer the primary path.
    Check it came up clean: `docker compose -f docker-compose.prod.yml logs -f`
    (expect `Server listening on port 4000`, then Ctrl+C to stop following).
 5. Separately, pull/build the client repo (`elle_f`) — see its own
-   `DEPLOY.md`. It needs `VITE_API_BASE_URL=https://api.isseylab.com` set
+   `DEPLOY.md`. It needs `VITE_API_BASE_URL=https://arco-api.elleeliason.com` set
    before its build step.
 6. Copy `Caddyfile` (from this repo) to the VPS's Caddy config location,
    filling in the real absolute path to the client repo's `dist/` (see the
@@ -96,11 +100,13 @@ fallback but is no longer the primary path.
    (or `systemctl reload caddy`, depending on how Caddy is installed on the
    VPS — follow whatever the existing VPS setup uses, per project instructions
    not to invent a new proxy topology.)
-7. DNS: point both `elle.isseylab.com` and `api.isseylab.com` A/AAAA records
-   at the VPS's IP before reloading Caddy, or the automatic HTTPS cert
-   issuance will fail.
-8. Verify: hit `https://api.isseylab.com/api/health` (should reach Express)
-   and `https://elle.isseylab.com/` (should serve the React app and
+7. DNS: point `arco.elleeliason.com`, `www.arco.elleeliason.com` and
+   `arco-api.elleeliason.com` A/AAAA records at the VPS's IP before reloading
+   Caddy, or the automatic HTTPS cert issuance will fail. The www record is
+   required even though it only redirects — Caddy still needs to answer the
+   ACME challenge on that host to obtain its certificate.
+8. Verify: hit `https://arco-api.elleeliason.com/api/health` (should reach Express)
+   and `https://arco.elleeliason.com/` (should serve the React app and
    successfully call the API cross-subdomain — check the browser network
    tab for CORS/cookie errors on login).
 
@@ -136,7 +142,7 @@ All names below already exist in `.env.example`; nothing new was invented here.
 - `DB_ROOT_PASSWORD` — placeholder, used only by `docker-compose.dev.yml` locally.
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` — MySQL connection.
 - `PORT` — Express listen port, must match `Caddyfile`'s `{$PORT}` in production.
-- `CORS_ORIGIN` — production client origin.
+- `CORS_ORIGIN` — comma-separated allowlist of production client origins (apex first).
 - `NODE_ENV` — set to `production` in `.env` on the VPS (read into the
   container via `docker-compose.prod.yml`'s `env_file`).
 - JWT / Jitsi vars — see `.env.example`.

@@ -55,7 +55,7 @@ router.post(
         [req.user.orgId, invitedRole, token, studentNameHint || null, req.user.id, expiresAt]
       );
 
-      res.status(201).json({ link: `${config.corsOrigin}/register?token=${token}` });
+      res.status(201).json({ link: `${config.appOrigin}/register?token=${token}` });
     } catch (err) {
       next(err);
     }

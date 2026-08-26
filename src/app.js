@@ -48,7 +48,7 @@ app.use(
 
 app.use(
   cors({
-    origin: config.corsOrigin,
+    origin: config.corsOrigins,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     // Required so the browser sends/receives the httpOnly refresh-token
     // cookie cross-origin between the Vite dev origin and this API origin.

@@ -27,10 +27,27 @@ if (missing.length > 0) {
   );
 }
 
+// CORS_ORIGIN is a comma-separated allowlist so a site reachable at both its
+// apex and www host can be served by one API. Split here rather than at each
+// call site, since the two needs differ: the CORS middleware wants every
+// allowed origin, while links emailed or handed to a user want exactly one.
+const corsOrigins = process.env.CORS_ORIGIN.split(',')
+  .map((origin) => origin.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
+if (corsOrigins.length === 0) {
+  throw new Error('CORS_ORIGIN must list at least one origin');
+}
+
 module.exports = {
   nodeEnv: process.env.NODE_ENV || 'development',
   port: Number(process.env.PORT),
-  corsOrigin: process.env.CORS_ORIGIN,
+  // Every origin the browser may call this API from.
+  corsOrigins,
+  // The canonical origin, used to build links that get shown to a person
+  // (password reset, invitations). The first entry wins, so list the apex
+  // host first in CORS_ORIGIN.
+  appOrigin: corsOrigins[0],
   db: {
     host: process.env.DB_HOST,
     port: Number(process.env.DB_PORT),
